@@ -36,7 +36,7 @@ jobs:
             -framework Foundation -framework UIKit -framework AVFoundation \
             -framework CoreVideo -framework CoreImage -framework CoreGraphics \
             -framework Vision -framework CoreMotion -framework CoreMedia \
-            -framework AudioToolbox -framework ImageIO \
+            -framework AudioToolbox -framework ImageIO -framework QuartzCore \
             Tweak/Tweak.m Tweak/IMUSynth.m -o TLCam.dylib
           file TLCam.dylib
           ls -l TLCam.dylib
