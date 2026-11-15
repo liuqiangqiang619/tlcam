@@ -18,6 +18,7 @@
 #import <unistd.h>
 #import <Vision/Vision.h>
 #import <pthread.h>
+#import <string.h>
 #import <dispatch/dispatch.h>
 #import <netinet/tcp.h>
 
@@ -457,6 +458,38 @@ static CIContext* g_ciCtx = nil;
 static CVPixelBufferPoolRef g_scalePool = NULL;
 static size_t g_scalePoolW = 0, g_scalePoolH = 0;
 
+
+// 把 src(420v/420f 双平面) 直接写进 dst 的像素内存：不改 buffer、不改时间戳、不新建 sample buffer
+static BOOL CopyIntoPixelBuffer(CVPixelBufferRef dst, CVPixelBufferRef src) {
+    if (!dst || !src) return NO;
+    OSType fd = CVPixelBufferGetPixelFormatType(dst);
+    OSType fs = CVPixelBufferGetPixelFormatType(src);
+    BOOL pd = (fd == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || fd == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+    BOOL ps = (fs == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || fs == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+    if (!pd || !ps) return NO;
+    if (CVPixelBufferGetPlaneCount(dst) < 2 || CVPixelBufferGetPlaneCount(src) < 2) return NO;
+    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) return NO;
+    if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        CVPixelBufferUnlockBaseAddress(dst, 0);
+        return NO;
+    }
+    BOOL ok = YES;
+    for (size_t pl = 0; pl < 2 && ok; pl++) {
+        size_t dw = CVPixelBufferGetWidthOfPlane(dst, pl), dh = CVPixelBufferGetHeightOfPlane(dst, pl);
+        size_t sw = CVPixelBufferGetWidthOfPlane(src, pl), sh = CVPixelBufferGetHeightOfPlane(src, pl);
+        if (dw != sw || dh != sh) { ok = NO; break; }
+        uint8_t* dp = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(dst, pl);
+        const uint8_t* sp = (const uint8_t*)CVPixelBufferGetBaseAddressOfPlane(src, pl);
+        size_t ds = CVPixelBufferGetBytesPerRowOfPlane(dst, pl);
+        size_t ss = CVPixelBufferGetBytesPerRowOfPlane(src, pl);
+        if (!dp || !sp) { ok = NO; break; }
+        for (size_t y = 0; y < dh; y++) memcpy(dp + y * ds, sp + y * ss, dw);
+    }
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    return ok;
+}
+
 static CVPixelBufferRef ScaleBuffer(CVPixelBufferRef src, size_t tw, size_t th) {
     if (!g_ciCtx) g_ciCtx = [CIContext contextWithOptions:nil];
     if (!g_scalePool || g_scalePoolW != tw || g_scalePoolH != th) {
@@ -518,6 +551,21 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         CVPixelBufferRef scaled = ScaleBuffer(use, inW, inH);
         CVPixelBufferRelease(use);
         use = scaled;   // 可能为 NULL -> 下面透传
+    }
+
+    // 首选：原地写进相机自己的 buffer，再把原始 sample buffer 原样转发（最不容易崩）
+    BOOL sameDim = NO;
+    if (use && inPB) {
+        sameDim = (CVPixelBufferGetWidth(inPB) == CVPixelBufferGetWidth(use) &&
+                   CVPixelBufferGetHeight(inPB) == CVPixelBufferGetHeight(use));
+    }
+    if (use && sameDim) {
+        if (CopyIntoPixelBuffer(inPB, use)) {
+            if (g_realDelegate && [g_realDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)])
+                [g_realDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+            CVPixelBufferRelease(use); use = NULL;
+            return;
+        }
     }
 
     if (!use) {                       // 还没有 PC 帧 → 透传相机
