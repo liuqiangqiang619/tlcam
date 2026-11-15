@@ -18,6 +18,7 @@
 #import <unistd.h>
 #import <Vision/Vision.h>
 #import <pthread.h>
+#import <dispatch/dispatch.h>
 #import <netinet/tcp.h>
 
 // 由 IMUSynth.m 提供
@@ -543,8 +544,7 @@ static void my_setDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queu
     if (orig_setDelegate) orig_setDelegate(self, _cmd, isAudio ? (id)g_ap : (id)g_proxy, queue);
 }
 
-__attribute__((constructor))
-static void TLInit(void) {
+static void TLInstallHooks(void) {
     // 视频与音频输出都要换 delegate（两者没有共同的方法实现，分别 hook）
     for (NSString* cn in @[@"AVCaptureVideoDataOutput", @"AVCaptureAudioDataOutput"]) {
         Class cls = NSClassFromString(cn);
@@ -575,3 +575,18 @@ static void TLInit(void) {
     pthread_t at;
     pthread_create(&at, NULL, AudioThread, NULL);
 }
+
+__attribute__((constructor))
+static void TLInit(void) {
+    @try {
+        // 延迟 0.8s，等 App 完成启动、类都加载好再装 hook
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try { TLInstallHooks(); }
+            @catch (NSException* e) { NSLog(@"[TL] install exception: %@", e); }
+        });
+    } @catch (NSException* e) {
+        NSLog(@"[TL] ctor exception: %@", e);
+    }
+}
+
