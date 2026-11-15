@@ -54,7 +54,7 @@ static CVPixelBufferPoolRef g_pool = NULL;
 static void EnsurePool(void) {
     if (g_pool) return;
     NSDictionary* attrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
         (id)kCVPixelBufferWidthKey:  @(OUT_W),
         (id)kCVPixelBufferHeightKey: @(OUT_H),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
@@ -88,7 +88,9 @@ static CVPixelBufferRef DecodeJPEG(const void* data, size_t len) {
     ci = [ci imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
     double mwx = 0, mwy = 0, mdx = 0, mdy = 0;
     TLGetMotionState(&mwx, &mwy, &mdx, &mdy);
-    ci = CameraImperfections(ci, mdx, mdy);
+    #if TL_ENABLE_IMPERFECT
+        ci = CameraImperfections(ci, mdx, mdy);
+#endif
     [g_ci render:ci toCVPixelBuffer:pb bounds:CGRectMake(0, 0, OUT_W, OUT_H) colorSpace:CGColorSpaceCreateDeviceRGB()];
     CGImageRelease(img);
     return pb;
@@ -203,14 +205,14 @@ static CIContext*         g_flowCI = nil;
 static CVPixelBufferRef DownscaleForFlow(CVPixelBufferRef src) {
     if (!g_flowCI) g_flowCI = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer: @NO }];
     NSDictionary* attrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
         (id)kCVPixelBufferWidthKey:  @(FLOW_W),
         (id)kCVPixelBufferHeightKey: @(FLOW_H),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
     };
     CVPixelBufferRef dst = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, FLOW_W, FLOW_H,
-                            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                             (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess || !dst)
         return NULL;
     CIImage* ci = [CIImage imageWithCVPixelBuffer:src];
@@ -460,7 +462,7 @@ static CVPixelBufferRef ScaleBuffer(CVPixelBufferRef src, size_t tw, size_t th) 
     if (!g_scalePool || g_scalePoolW != tw || g_scalePoolH != th) {
         if (g_scalePool) { CVPixelBufferPoolRelease(g_scalePool); g_scalePool = NULL; }
         NSDictionary* attrs = @{
-            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
             (id)kCVPixelBufferWidthKey: @(tw),
             (id)kCVPixelBufferHeightKey: @(th),
             (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
@@ -488,6 +490,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection*)connection {
     CVPixelBufferRef inPB = CMSampleBufferGetImageBuffer(sampleBuffer);
     CVPixelBufferRef use = NULL;
+    @try {
     pthread_mutex_lock(&g_lock);
     BOOL dimOk = YES;
     if (inPB && g_latest) {
@@ -515,8 +518,11 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
     CMVideoFormatDescriptionRef fmt = NULL;
     if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, use, &fmt) == noErr) {
-        CMTime pts = CMClockGetTime(CMClockGetHostTimeClock());
-        CMSampleTimingInfo timing = { CMTimeMake(1, OUT_FPS), pts, pts };
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        if (!CMTIME_IS_VALID(pts)) pts = CMClockGetTime(CMClockGetHostTimeClock());
+        CMTime dur = CMSampleBufferGetDuration(sampleBuffer);
+        if (!CMTIME_IS_VALID(dur) || CMTimeGetSeconds(dur) <= 0) dur = CMTimeMake(1, OUT_FPS);
+        CMSampleTimingInfo timing = { dur, pts, pts };
         CMSampleBufferRef sb = NULL;
         if (CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, use, fmt, &timing, &sb) == noErr) {
             if (g_realDelegate)
@@ -525,8 +531,15 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         }
         CFRelease(fmt);
     }
+#if TL_ENABLE_FLOW
     ScheduleFlow(use);
-    CVPixelBufferRelease(use);
+#endif
+    CVPixelBufferRelease(use); use = NULL;
+    } @catch (NSException* e) {
+        if (use) { CVPixelBufferRelease(use); use = NULL; }
+        if (g_realDelegate) [g_realDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+        NSLog(@"[TL] proxy exception %@", e);
+    }
 }
 @end
 
