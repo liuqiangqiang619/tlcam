@@ -512,9 +512,15 @@ static CVPixelBufferRef ConvertToMatch(CVPixelBufferRef src, CVPixelBufferRef li
         (id)kCVPixelBufferHeightKey: @(h),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
     };
+    static CVPixelBufferPoolRef pool = NULL;
+    static size_t pw = 0, ph = 0; static OSType pf = 0;
+    if (!pool || pw != w || ph != h || pf != fmt) {
+        if (pool) { CVPixelBufferPoolRelease(pool); pool = NULL; }
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &pool);
+        pw = w; ph = h; pf = fmt;
+    }
     CVPixelBufferRef dst = NULL;
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt,
-                            (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess || !dst) return NULL;
+    if (!pool || CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &dst) != kCVReturnSuccess || !dst) return NULL;
     if (!g_ciCtx) g_ciCtx = [CIContext contextWithOptions:nil];
     CIImage* ci = [CIImage imageWithCVPixelBuffer:src];
     CGFloat sx = (CGFloat)w / CVPixelBufferGetWidth(src);
@@ -574,7 +580,8 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         dimOk = (CVPixelBufferGetWidth(inPB) == CVPixelBufferGetWidth(g_latest) &&
                  CVPixelBufferGetHeight(inPB) == CVPixelBufferGetHeight(g_latest));
     }
-    if (g_latest && g_latestSeq != g_sentSeq) {
+    if (g_latest) {
+        // 每一帧都用最近一帧 PC 画面（哪怕没有新帧），否则相机的原始帧会漏出去 -> 画面闪烁
         use = CVPixelBufferRetain(g_latest);
         g_sentSeq = g_latestSeq;
     }
@@ -591,7 +598,14 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     // 首选：原地写进相机自己的 buffer，再把原始 sample buffer 原样转发（最不容易崩）
     // 首选：把 PC 帧画进相机自己的 buffer，再原样转发原始 sample buffer
     if (use && inPB) {
-        CVPixelBufferRef tmp = ConvertToMatch(use, inPB);   // 尺寸/格式对齐到相机 buffer
+        CVPixelBufferRef tmp = NULL;
+        if (CVPixelBufferGetWidth(use) == CVPixelBufferGetWidth(inPB) &&
+            CVPixelBufferGetHeight(use) == CVPixelBufferGetHeight(inPB) &&
+            CVPixelBufferGetPixelFormatType(use) == CVPixelBufferGetPixelFormatType(inPB)) {
+            tmp = CVPixelBufferRetain(use);   // 已经是目标尺寸+格式，省掉一次 CI 渲染
+        } else {
+            tmp = ConvertToMatch(use, inPB);  // 尺寸/格式对齐到相机 buffer
+        }
         BOOL painted = tmp ? CopyIntoPixelBuffer(inPB, tmp) : NO;
         if (tmp) CVPixelBufferRelease(tmp);
         static int failLog = 0;
