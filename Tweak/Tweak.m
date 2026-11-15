@@ -17,6 +17,8 @@
 #import <arpa/inet.h>
 #import <unistd.h>
 #import <Vision/Vision.h>
+#import <pthread.h>
+#import <netinet/tcp.h>
 
 // 由 IMUSynth.m 提供
 extern void TLUpdateMotionFromFlow(double dxPix, double dyPix, double dt);
@@ -37,6 +39,8 @@ static id              g_proxy        = nil;
 static CVPixelBufferRef g_latest = NULL;      // 最新一帧（420f）
 static uint64_t         g_latestSeq = 0;      // 帧序号，用来判断“有没有新帧”
 static uint64_t         g_sentSeq = 0;
+static CIImage* CameraImperfections(CIImage* in, double dx, double dy);
+
 static pthread_mutex_t  g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static CIContext*       g_ci = nil;
