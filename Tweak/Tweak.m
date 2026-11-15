@@ -459,35 +459,68 @@ static CVPixelBufferPoolRef g_scalePool = NULL;
 static size_t g_scalePoolW = 0, g_scalePoolH = 0;
 
 
-// 把 src(420v/420f 双平面) 直接写进 dst 的像素内存：不改 buffer、不改时间戳、不新建 sample buffer
+// 把 src 直接写进 dst 的像素内存（支持 420 双平面 与 BGRA 单平面）
 static BOOL CopyIntoPixelBuffer(CVPixelBufferRef dst, CVPixelBufferRef src) {
     if (!dst || !src) return NO;
-    OSType fd = CVPixelBufferGetPixelFormatType(dst);
-    OSType fs = CVPixelBufferGetPixelFormatType(src);
-    BOOL pd = (fd == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || fd == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
-    BOOL ps = (fs == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || fs == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
-    if (!pd || !ps) return NO;
-    if (CVPixelBufferGetPlaneCount(dst) < 2 || CVPixelBufferGetPlaneCount(src) < 2) return NO;
+    size_t dn = CVPixelBufferGetPlaneCount(dst), sn = CVPixelBufferGetPlaneCount(src);
+    if (dn != sn) return NO;
     if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) return NO;
     if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
         CVPixelBufferUnlockBaseAddress(dst, 0);
         return NO;
     }
     BOOL ok = YES;
-    for (size_t pl = 0; pl < 2 && ok; pl++) {
-        size_t dw = CVPixelBufferGetWidthOfPlane(dst, pl), dh = CVPixelBufferGetHeightOfPlane(dst, pl);
-        size_t sw = CVPixelBufferGetWidthOfPlane(src, pl), sh = CVPixelBufferGetHeightOfPlane(src, pl);
-        if (dw != sw || dh != sh) { ok = NO; break; }
-        uint8_t* dp = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(dst, pl);
-        const uint8_t* sp = (const uint8_t*)CVPixelBufferGetBaseAddressOfPlane(src, pl);
-        size_t ds = CVPixelBufferGetBytesPerRowOfPlane(dst, pl);
-        size_t ss = CVPixelBufferGetBytesPerRowOfPlane(src, pl);
-        if (!dp || !sp) { ok = NO; break; }
-        for (size_t y = 0; y < dh; y++) memcpy(dp + y * ds, sp + y * ss, dw);
+    if (dn == 0) {
+        size_t dw = CVPixelBufferGetWidth(dst), dh = CVPixelBufferGetHeight(dst);
+        size_t sw = CVPixelBufferGetWidth(src), sh = CVPixelBufferGetHeight(src);
+        size_t bpp = 4;
+        OSType fd = CVPixelBufferGetPixelFormatType(dst);
+        if (fd == kCVPixelFormatType_32BGRA || fd == kCVPixelFormatType_32ARGB) bpp = 4;
+        if (dw != sw || dh != sh) ok = NO;
+        uint8_t* dp = (uint8_t*)CVPixelBufferGetBaseAddress(dst);
+        const uint8_t* sp = (const uint8_t*)CVPixelBufferGetBaseAddress(src);
+        size_t ds = CVPixelBufferGetBytesPerRow(dst), ss = CVPixelBufferGetBytesPerRow(src);
+        if (!dp || !sp) ok = NO;
+        for (size_t y = 0; ok && y < dh; y++) memcpy(dp + y * ds, sp + y * ss, dw * bpp);
+    } else {
+        for (size_t pl = 0; pl < dn && ok; pl++) {
+            size_t dw = CVPixelBufferGetWidthOfPlane(dst, pl), dh = CVPixelBufferGetHeightOfPlane(dst, pl);
+            size_t sw = CVPixelBufferGetWidthOfPlane(src, pl), sh = CVPixelBufferGetHeightOfPlane(src, pl);
+            if (dw != sw || dh != sh) { ok = NO; break; }
+            uint8_t* dp = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(dst, pl);
+            const uint8_t* sp = (const uint8_t*)CVPixelBufferGetBaseAddressOfPlane(src, pl);
+            size_t ds = CVPixelBufferGetBytesPerRowOfPlane(dst, pl);
+            size_t ss = CVPixelBufferGetBytesPerRowOfPlane(src, pl);
+            if (!dp || !sp) { ok = NO; break; }
+            for (size_t y = 0; y < dh; y++) memcpy(dp + y * ds, sp + y * ss, dw);
+        }
     }
     CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
     CVPixelBufferUnlockBaseAddress(dst, 0);
     return ok;
+}
+
+// 按目标 buffer 的尺寸+像素格式渲染一张临时图（给 BGRA / 尺寸不一致时用）
+static CVPixelBufferRef ConvertToMatch(CVPixelBufferRef src, CVPixelBufferRef like) {
+    size_t w = CVPixelBufferGetWidth(like), h = CVPixelBufferGetHeight(like);
+    OSType fmt = CVPixelBufferGetPixelFormatType(like);
+    NSDictionary* attrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(fmt),
+        (id)kCVPixelBufferWidthKey: @(w),
+        (id)kCVPixelBufferHeightKey: @(h),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    CVPixelBufferRef dst = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt,
+                            (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess || !dst) return NULL;
+    if (!g_ciCtx) g_ciCtx = [CIContext contextWithOptions:nil];
+    CIImage* ci = [CIImage imageWithCVPixelBuffer:src];
+    CGFloat sx = (CGFloat)w / CVPixelBufferGetWidth(src);
+    CGFloat sy = (CGFloat)h / CVPixelBufferGetHeight(src);
+    ci = [ci imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
+    [g_ciCtx render:ci toCVPixelBuffer:dst bounds:CGRectMake(0, 0, w, h)
+         colorSpace:CGColorSpaceCreateDeviceRGB()];
+    return dst;
 }
 
 static CVPixelBufferRef ScaleBuffer(CVPixelBufferRef src, size_t tw, size_t th) {
@@ -554,13 +587,12 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
 
     // 首选：原地写进相机自己的 buffer，再把原始 sample buffer 原样转发（最不容易崩）
-    BOOL sameDim = NO;
+    // 首选：把 PC 帧画进相机自己的 buffer，再原样转发原始 sample buffer
     if (use && inPB) {
-        sameDim = (CVPixelBufferGetWidth(inPB) == CVPixelBufferGetWidth(use) &&
-                   CVPixelBufferGetHeight(inPB) == CVPixelBufferGetHeight(use));
-    }
-    if (use && sameDim) {
-        if (CopyIntoPixelBuffer(inPB, use)) {
+        CVPixelBufferRef tmp = ConvertToMatch(use, inPB);   // 尺寸/格式对齐到相机 buffer
+        BOOL painted = tmp ? CopyIntoPixelBuffer(inPB, tmp) : NO;
+        if (tmp) CVPixelBufferRelease(tmp);
+        if (painted) {
             if (g_realDelegate && [g_realDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)])
                 [g_realDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
             CVPixelBufferRelease(use); use = NULL;
