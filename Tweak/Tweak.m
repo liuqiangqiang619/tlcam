@@ -21,6 +21,7 @@
 #import <string.h>
 #import <dispatch/dispatch.h>
 #import <netinet/tcp.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 // 由 IMUSynth.m 提供
 extern void TLUpdateMotionFromFlow(double dxPix, double dyPix, double dt);
@@ -38,7 +39,7 @@ static id              g_realAudioDelegate = nil;
 static dispatch_queue_t g_realQueue   = nil;
 static id              g_proxy        = nil;
 
-#define TL_ENABLE_AUDIO 0
+#define TL_ENABLE_AUDIO 1
 #define TL_ENABLE_IMU   0
 
 static CVPixelBufferRef g_latest = NULL;      // 最新一帧（420f）
@@ -140,6 +141,132 @@ static CIImage* CameraImperfections(CIImage* img, double dx, double dy) {
         if (blur.outputImage) o = blur.outputImage;
     }
     return o;
+}
+
+// ---------------- USB 直连：手机监听 9800，PC 主动连（经 usbmux）----------------
+// 传输：12 字节头 {type u8, flags u8, len u16 BE, seq u32 BE, pts u32 BE} + 一个完整 NAL
+static VTDecompressionSessionRef g_vt = NULL;
+static CMVideoFormatDescriptionRef g_vtFmt = NULL;
+static NSData* g_sps = nil;
+static NSData* g_pps = nil;
+static int g_vtFrames = 0;
+
+static void VTReset(void) {
+    if (g_vt) { VTDecompressionSessionInvalidate(g_vt); CFRelease(g_vt); g_vt = NULL; }
+    if (g_vtFmt) { CFRelease(g_vtFmt); g_vtFmt = NULL; }
+}
+
+static void VTDecCallback(void* refCon, void* srcFrame, OSStatus status,
+                          VTDecodeInfoFlags flags, CVImageBufferRef image,
+                          CMTime pts, CMTime dur) {
+    if (status != noErr || !image) return;
+    CVPixelBufferRef pb = (CVPixelBufferRef)CVBufferRetain(image);
+    pthread_mutex_lock(&g_lock);
+    if (g_latest) CVPixelBufferRelease(g_latest);
+    g_latest = pb;
+    g_latestSeq++;
+    pthread_mutex_unlock(&g_lock);
+    g_vtFrames++;
+}
+
+static void VTEnsureSession(void) {
+    if (g_vt) return;
+    if (g_sps.length < 4 || g_pps.length < 4) return;
+    const uint8_t* ps[2] = { (const uint8_t*)g_sps.bytes, (const uint8_t*)g_pps.bytes };
+    size_t pl[2] = { g_sps.length, g_pps.length };
+    if (CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, 2, ps, pl, 4, &g_vtFmt) != noErr) {
+        NSLog(@"[TL] h264 fmt desc failed sps=%zu pps=%zu", g_sps.length, g_pps.length);
+        return;
+    }
+    NSDictionary* dst = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    VTDecompressionOutputCallbackRecord cb = {0};
+    cb.decompressionOutputCallback = VTDecCallback;
+    cb.decompressionOutputRefCon = NULL;
+    OSStatus st = VTDecompressionSessionCreate(kCFAllocatorDefault, g_vtFmt, NULL,
+                                               (__bridge CFDictionaryRef)dst, &cb, &g_vt);
+    if (st != noErr) {
+        NSLog(@"[TL] vt session failed %d", (int)st);
+        g_vt = NULL;
+        return;
+    }
+    NSLog(@"[TL] h264 decoder ready %dx%d", (int)CMVideoFormatDescriptionGetDimensions(g_vtFmt).width,
+          (int)CMVideoFormatDescriptionGetDimensions(g_vtFmt).height);
+}
+
+static void VTFeedNAL(const uint8_t* p, size_t n) {
+    if (n < 5) return;
+    int type = p[0] & 0x1f;
+    if (type == 7) { g_sps = [NSData dataWithBytes:p length:n]; VTReset(); VTEnsureSession(); return; }
+    if (type == 8) { g_pps = [NSData dataWithBytes:p length:n]; VTReset(); VTEnsureSession(); return; }
+    if (type != 1 && type != 5) return;
+    if (!g_vt) VTEnsureSession();
+    if (!g_vt) return;
+
+    size_t total = n + 4;
+    uint8_t* buf = (uint8_t*)malloc(total);
+    if (!buf) return;
+    uint32_t be = htonl((uint32_t)n);
+    memcpy(buf, &be, 4);
+    memcpy(buf + 4, p, n);
+
+    CMBlockBufferRef bb = NULL;
+    if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, buf, total, kCFAllocatorMalloc,
+                                           NULL, 0, total, 0, &bb) != noErr) { free(buf); return; }
+    CMSampleBufferRef sb = NULL;
+    size_t sz = total;
+    CMSampleTimingInfo t = { CMTimeMake(1, 30), kCMTimeInvalid, kCMTimeInvalid };
+    if (CMSampleBufferCreateReady(kCFAllocatorDefault, bb, g_vtFmt, 1, 1, &t, 1, &sz, &sb) == noErr && sb) {
+        VTDecompressionSessionDecodeFrame(g_vt, sb, 0, NULL, 0);
+        CFRelease(sb);
+    }
+    CFRelease(bb);
+}
+
+static void* USBVideoThread(void* arg) {
+    @autoreleasepool {
+        while (1) {
+            int ls = socket(AF_INET, SOCK_STREAM, 0);
+            if (ls < 0) { usleep(1000 * 1000); continue; }
+            int one = 1;
+            setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            struct sockaddr_in a = {0};
+            a.sin_family = AF_INET;
+            a.sin_port = htons(PC_PORT);
+            a.sin_addr.s_addr = INADDR_ANY;
+            if (bind(ls, (struct sockaddr*)&a, sizeof(a)) != 0) {
+                NSLog(@"[TL] bind %d failed", PC_PORT);
+                close(ls);
+                usleep(1000 * 1000);
+                continue;
+            }
+            listen(ls, 1);
+            NSLog(@"[TL] usb video listen %d", PC_PORT);
+            while (1) {
+                int c = accept(ls, NULL, NULL);
+                if (c < 0) { usleep(200 * 1000); continue; }
+                int nd = 1;
+                setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+                NSLog(@"[TL] usb video connected");
+                while (1) {
+                    uint8_t h[16];
+                    if (!ReadFull(c, h, 16)) break;
+                    uint32_t len = ((uint32_t)h[0] << 24) | ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | (uint32_t)h[3];
+                    if (len < 4 || len > 4 * 1024 * 1024) { NSLog(@"[TL] bad nal len %u", len); break; }
+                    uint8_t* d = (uint8_t*)malloc(len);
+                    if (!d) break;
+                    if (!ReadFull(c, d, len)) { free(d); break; }
+                    @try { VTFeedNAL(d, len); } @catch (NSException* e) { NSLog(@"[TL] nal exception %@", e); }
+                    free(d);
+                }
+                close(c);
+                NSLog(@"[TL] usb video closed");
+            }
+        }
+    }
+    return NULL;
 }
 
 // ---------------- 接收线程：TCP 收 JPEG ----------------
@@ -333,21 +460,40 @@ static int ConnectPC2(int port) {
 
 static void* AudioThread(void* arg) {
     @autoreleasepool {
-        int s = -1;
         while (1) {
-            if (s < 0) {
-                s = ConnectPC2(g_audioPort);
-                if (s < 0) { usleep(500 * 1000); continue; }
-                NSLog(@"[TL] audio connected to %s:%d", PC_HOST, g_audioPort);
+            int ls = socket(AF_INET, SOCK_STREAM, 0);
+            if (ls < 0) { usleep(1000 * 1000); continue; }
+            int one = 1;
+            setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            struct sockaddr_in a = {0};
+            a.sin_family = AF_INET;
+            a.sin_port = htons(g_audioPort);
+            a.sin_addr.s_addr = INADDR_ANY;
+            if (bind(ls, (struct sockaddr*)&a, sizeof(a)) != 0) {
+                close(ls); usleep(1000 * 1000); continue;
             }
-            uint32_t beLen = 0;
-            if (!ReadFull(s, &beLen, 4)) { close(s); s = -1; continue; }
-            uint32_t len = ntohl(beLen);
-            if (len == 0 || len > 65536) { close(s); s = -1; continue; }
-            uint8_t* tmp = malloc(len);
-            if (!ReadFull(s, tmp, len)) { free(tmp); close(s); s = -1; continue; }
-            AudioPush(tmp, len);
-            free(tmp);
+            listen(ls, 1);
+            NSLog(@"[TL] usb audio listen %d", g_audioPort);
+            while (1) {
+                int c = accept(ls, NULL, NULL);
+                if (c < 0) { usleep(200 * 1000); continue; }
+                int nd = 1;
+                setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+                NSLog(@"[TL] usb audio connected");
+                while (1) {
+                    uint8_t h[16];
+                    if (!ReadFull(c, h, 16)) break;
+                    uint32_t len = ((uint32_t)h[0] << 24) | ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | (uint32_t)h[3];
+                    if (len < 16 || len > 65536) { NSLog(@"[TL] bad pcm len %u", len); break; }
+                    uint8_t* d = (uint8_t*)malloc(len);
+                    if (!d) break;
+                    if (!ReadFull(c, d, len)) { free(d); break; }
+                    AudioPush(d, len);
+                    free(d);
+                }
+                close(c);
+                NSLog(@"[TL] usb audio closed");
+            }
         }
     }
     return NULL;
@@ -390,6 +536,79 @@ static CMSampleBufferRef MakeAudioBuffer(size_t frames) {
     return sb;
 }
 
+// 把 PC 的 PCM 写进相机自己的 audio buffer（不新建 sample buffer，最不容易崩）
+static BOOL PaintAudioIntoBuffer(CMSampleBufferRef sb) {
+    if (!sb) return NO;
+    if (g_ard == g_awr) return NO;                       // 还没有 PC 音频
+    CMFormatDescriptionRef fdesc = CMSampleBufferGetFormatDescription(sb);
+    if (!fdesc) return NO;
+    const AudioStreamBasicDescription* asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fdesc);
+    if (!asbd || asbd->mSampleRate < 8000 || asbd->mBytesPerFrame == 0) return NO;
+
+    size_t ablSize = 0;
+    if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sb, &ablSize, NULL, 0, NULL, NULL, 0, NULL) != noErr || ablSize == 0)
+        return NO;
+    AudioBufferList* abl = (AudioBufferList*)malloc(ablSize);
+    if (!abl) return NO;
+    CMBlockBufferRef bb = NULL;
+    OSStatus st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        sb, &ablSize, abl, ablSize, NULL, NULL,
+        kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &bb);
+    BOOL ok = NO;
+    if (st == noErr && abl->mNumberBuffers > 0) {
+        BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+        BOOL nonInt  = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+        UInt32 chTotal = asbd->mChannelsPerFrame ? asbd->mChannelsPerFrame : 1;
+        UInt32 chInBuf = nonInt ? 1 : chTotal;
+        UInt32 bps = asbd->mBitsPerChannel / 8;
+        AudioBuffer* b0 = &abl->mBuffers[0];
+        if (bps && b0->mData && chInBuf) {
+            UInt32 frames = (UInt32)(b0->mDataByteSize / (bps * chInBuf));
+            if (frames > 0 && frames <= 16384) {
+                size_t need = (size_t)frames * 4;
+                int16_t* src = (int16_t*)malloc(need);
+                if (src) {
+                    size_t got = AudioPop(src, need);
+                    size_t have = got / 4;
+                    if (have > 0) {
+                        for (UInt32 f = 0; f < frames; ++f) {
+                            float l = 0.0f, r = 0.0f;
+                            if (f < have) { l = src[f * 2] / 32768.0f; r = src[f * 2 + 1] / 32768.0f; }
+                            if (nonInt) {
+                                for (UInt32 bi = 0; bi < abl->mNumberBuffers; ++bi) {
+                                    AudioBuffer* b = &abl->mBuffers[bi];
+                                    if (!b->mData || (f + 1) * bps > b->mDataByteSize) continue;
+                                    float v = (bi == 0) ? l : (chTotal > 1 ? r : (l + r) * 0.5f);
+                                    if (isFloat) ((float*)b->mData)[f] = v;
+                                    else ((int16_t*)b->mData)[f] = (int16_t)(v * 32767.0f);
+                                }
+                            } else {
+                                AudioBuffer* b = &abl->mBuffers[0];
+                                if (b->mData && (f + 1) * bps * chInBuf <= b->mDataByteSize) {
+                                    if (isFloat) {
+                                        float* p = (float*)b->mData;
+                                        p[f * 2] = l;
+                                        if (chTotal > 1) p[f * 2 + 1] = r;
+                                    } else {
+                                        int16_t* p = (int16_t*)b->mData;
+                                        p[f * 2] = (int16_t)(l * 32767.0f);
+                                        if (chTotal > 1) p[f * 2 + 1] = (int16_t)(r * 32767.0f);
+                                    }
+                                }
+                            }
+                        }
+                        ok = YES;
+                    }
+                    free(src);
+                }
+            }
+        }
+    }
+    if (bb) CFRelease(bb);
+    free(abl);
+    return ok;
+}
+
 @interface TLAudioProxy : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
 @end
 
@@ -401,11 +620,13 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     if (g_realAudioDelegate) [g_realAudioDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
     return;
 #endif
-    CMSampleBufferRef sb = MakeAudioBuffer(1024);
-    if (sb) {
-        if (g_realAudioDelegate) [g_realAudioDelegate captureOutput:output didOutputSampleBuffer:sb fromConnection:connection];
-        CFRelease(sb);
-        return;
+    @try {
+        if (PaintAudioIntoBuffer(sampleBuffer)) {
+            if (g_realAudioDelegate) [g_realAudioDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+            return;
+        }
+    } @catch (NSException* e) {
+        NSLog(@"[TL] audio paint exception %@", e);
     }
     if (g_realAudioDelegate) [g_realAudioDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
 }
@@ -699,7 +920,7 @@ static void TLInstallHooks(void) {
     if (getenv("TL_AUDIO_PORT")) g_audioPort = atoi(getenv("TL_AUDIO_PORT"));
 
     pthread_t t;
-    pthread_create(&t, NULL, ReceiverThread, NULL);
+    pthread_create(&t, NULL, USBVideoThread, NULL);   // USB：手机监听 9800，PC 经 usbmux 连入
     pthread_t at;
     pthread_create(&at, NULL, AudioThread, NULL);
 }
