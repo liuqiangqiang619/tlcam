@@ -481,7 +481,8 @@ static BOOL CopyIntoPixelBuffer(CVPixelBufferRef dst, CVPixelBufferRef src) {
         const uint8_t* sp = (const uint8_t*)CVPixelBufferGetBaseAddress(src);
         size_t ds = CVPixelBufferGetBytesPerRow(dst), ss = CVPixelBufferGetBytesPerRow(src);
         if (!dp || !sp) ok = NO;
-        for (size_t y = 0; ok && y < dh; y++) memcpy(dp + y * ds, sp + y * ss, dw * bpp);
+        size_t rowBytes = ds < ss ? ds : ss;
+        for (size_t y = 0; ok && y < dh; y++) memcpy(dp + y * ds, sp + y * ss, rowBytes);
     } else {
         for (size_t pl = 0; pl < dn && ok; pl++) {
             size_t dw = CVPixelBufferGetWidthOfPlane(dst, pl), dh = CVPixelBufferGetHeightOfPlane(dst, pl);
@@ -492,7 +493,8 @@ static BOOL CopyIntoPixelBuffer(CVPixelBufferRef dst, CVPixelBufferRef src) {
             size_t ds = CVPixelBufferGetBytesPerRowOfPlane(dst, pl);
             size_t ss = CVPixelBufferGetBytesPerRowOfPlane(src, pl);
             if (!dp || !sp) { ok = NO; break; }
-            for (size_t y = 0; y < dh; y++) memcpy(dp + y * ds, sp + y * ss, dw);
+            size_t rowBytes = ds < ss ? ds : ss;
+            for (size_t y = 0; y < dh; y++) memcpy(dp + y * ds, sp + y * ss, rowBytes);
         }
     }
     CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
@@ -592,6 +594,11 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         CVPixelBufferRef tmp = ConvertToMatch(use, inPB);   // 尺寸/格式对齐到相机 buffer
         BOOL painted = tmp ? CopyIntoPixelBuffer(inPB, tmp) : NO;
         if (tmp) CVPixelBufferRelease(tmp);
+        static int failLog = 0;
+        if (!painted && (failLog++ % 120) == 0)
+            NSLog(@"[TL] paint failed dst=%zux%zu fmt=%u planes=%zu tmp=%d",
+                  CVPixelBufferGetWidth(inPB), CVPixelBufferGetHeight(inPB),
+                  CVPixelBufferGetPixelFormatType(inPB), CVPixelBufferGetPlaneCount(inPB), tmp != NULL);
         if (painted) {
             if (g_realDelegate && [g_realDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)])
                 [g_realDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
