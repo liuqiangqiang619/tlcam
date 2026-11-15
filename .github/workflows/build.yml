@@ -26,6 +26,7 @@ jobs:
                 -framework Foundation -framework UIKit \
                 -framework AVFoundation -framework CoreVideo \
                 -framework CoreImage -framework CoreGraphics -framework Vision -framework CoreMotion \
+                -framework CoreMedia -framework AudioToolbox \
                 -install_name @executable_path/Frameworks/TLCam.dylib \
                 Tweak/Tweak.m Tweak/IMUSynth.m -o TLCam.dylib
           ls -lh TLCam.dylib

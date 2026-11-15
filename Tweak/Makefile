@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = TLCam
 TLCam_FILES = Tweak.m IMUSynth.m
-TLCam_FRAMEWORKS = Foundation UIKit AVFoundation CoreVideo CoreImage CoreGraphics Vision CoreMotion
+TLCam_FRAMEWORKS = Foundation UIKit AVFoundation CoreVideo CoreImage CoreGraphics Vision CoreMotion CoreMedia AudioToolbox
 TLCam_LIBRARIES = pthread
 TLCam_CFLAGS = -fobjc-arc -O2
 TLCam_CODESIGN_FLAGS = -Sentitlements.plist
