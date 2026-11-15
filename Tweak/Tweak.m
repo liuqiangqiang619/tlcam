@@ -449,6 +449,35 @@ static void my_tap(id self, SEL _cmd, AVAudioNodeBus bus, AVAudioFrameCount bufS
 }
 
 // ---------------- 代理：把 PC 帧交给抖音 ----------------
+// ---- PC 帧尺寸与相机不一致时，用 CoreImage 缩放到相机尺寸 ----
+static CIContext* g_ciCtx = nil;
+static CVPixelBufferPoolRef g_pool = NULL;
+static size_t g_poolW = 0, g_poolH = 0;
+
+static CVPixelBufferRef ScaleBuffer(CVPixelBufferRef src, size_t tw, size_t th) {
+    if (!g_ciCtx) g_ciCtx = [CIContext contextWithOptions:nil];
+    if (!g_pool || g_poolW != tw || g_poolH != th) {
+        if (g_pool) { CVPixelBufferPoolRelease(g_pool); g_pool = NULL; }
+        NSDictionary* attrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+            (id)kCVPixelBufferWidthKey: @(tw),
+            (id)kCVPixelBufferHeightKey: @(th),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        };
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &g_pool);
+        g_poolW = tw; g_poolH = th;
+    }
+    if (!g_pool) return NULL;
+    CVPixelBufferRef dst = NULL;
+    if (CVPixelBufferPoolCreatePixelBuffer(NULL, g_pool, &dst) != kCVReturnSuccess || !dst) return NULL;
+    CIImage* ci = [CIImage imageWithCVPixelBuffer:src];
+    CGFloat sx = (CGFloat)tw / CVPixelBufferGetWidth(src);
+    CGFloat sy = (CGFloat)th / CVPixelBufferGetHeight(src);
+    CIImage* sc = [ci imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
+    [g_ciCtx render:sc toCVPixelBuffer:dst bounds:CGRectMake(0, 0, tw, th) colorSpace:CGColorSpaceCreateDeviceRGB()];
+    return dst;
+}
+
 @interface TLProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @end
 
@@ -464,11 +493,19 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         dimOk = (CVPixelBufferGetWidth(inPB) == CVPixelBufferGetWidth(g_latest) &&
                  CVPixelBufferGetHeight(inPB) == CVPixelBufferGetHeight(g_latest));
     }
-    if (dimOk && g_latest && g_latestSeq != g_sentSeq) {
+    if (g_latest && g_latestSeq != g_sentSeq) {
         use = CVPixelBufferRetain(g_latest);
         g_sentSeq = g_latestSeq;
     }
+    size_t inW = inPB ? CVPixelBufferGetWidth(inPB) : 0;
+    size_t inH = inPB ? CVPixelBufferGetHeight(inPB) : 0;
     pthread_mutex_unlock(&g_lock);
+
+    if (use && !dimOk && inW && inH) {
+        CVPixelBufferRef scaled = ScaleBuffer(use, inW, inH);
+        CVPixelBufferRelease(use);
+        use = scaled;   // 可能为 NULL -> 下面透传
+    }
 
     if (!use) {                       // 还没有 PC 帧 → 透传相机
         if (g_realDelegate) [g_realDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
