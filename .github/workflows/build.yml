@@ -20,7 +20,8 @@ jobs:
 
       - name: Fetch iPhoneOS SDK
         run: |
-          SDK=$(curl -s https://api.github.com/repos/theos/sdks/contents | jq -r '.[].name' | grep -E '^iPhoneOS[0-9.]+\.sdk$' | sort -V | tail -1)
+          SDK=$(curl -s https://api.github.com/repos/theos/sdks/contents | jq -r '.[].name' 2>/dev/null | grep -E '^iPhoneOS[0-9.]+\.sdk$' | sort -V | tail -1)
+          if [ -z "$SDK" ] || [ "$SDK" = "null" ]; then SDK=iPhoneOS16.5.sdk; fi
           echo "picked $SDK"
           echo "SDK=$SDK" >> $GITHUB_ENV
           git clone --filter=blob:none --no-checkout https://github.com/theos/sdks.git sdkrepo
