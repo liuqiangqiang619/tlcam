@@ -15,6 +15,7 @@ import socket
 import struct
 import subprocess
 import sys
+import os
 import time
 
 SOI = b"\xff\xd8"
@@ -161,6 +162,12 @@ def audio_server(port, ffmpeg, path, loop, start, camera_device=None, usbmux=Fal
 def find_ffmpeg(explicit):
     if explicit:
         return explicit
+    env = os.environ.get("FFMPEG")
+    if env and os.path.isfile(env):
+        return env
+    bundled = r"D:\TianLePlayer\_sdk\ffmpeg-master-latest-win64-lgpl-shared\bin\ffmpeg.exe"
+    if os.path.isfile(bundled):
+        return bundled
     return "ffmpeg"
 
 
