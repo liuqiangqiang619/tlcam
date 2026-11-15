@@ -33,15 +33,19 @@ jobs:
         run: |
           SYSROOT="$PWD/sdkrepo/$SDK"
           clang --version
+          set +e
           clang -target arm64-apple-ios15.0 -arch arm64 -isysroot "$SYSROOT" \
             -fobjc-arc -O2 -dynamiclib -fno-modules -fuse-ld=lld \
             -framework Foundation -framework UIKit -framework AVFoundation \
             -framework CoreVideo -framework CoreImage -framework CoreGraphics \
             -framework Vision -framework CoreMotion -framework CoreMedia \
             -framework AudioToolbox -framework ImageIO -framework QuartzCore \
-            Tweak/Tweak.m Tweak/IMUSynth.m -o TLCam.dylib
-          file TLCam.dylib
-          ls -l TLCam.dylib
+            Tweak/Tweak.m Tweak/IMUSynth.m -o TLCam.dylib > build.log 2>&1
+          rc=$?
+          cat build.log
+          file TLCam.dylib 2>/dev/null
+          ls -l TLCam.dylib 2>/dev/null
+          exit $rc
 
       - uses: actions/upload-artifact@v4
         with:
@@ -49,8 +53,11 @@ jobs:
           path: TLCam.dylib
 
       - name: Publish release asset
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "build-${{ github.run_number }}" TLCam.dylib \
-            -t "build ${{ github.run_number }}" -n "auto build"
+          gh release create "build-${{ github.run_number }}" TLCam.dylib build.log \
+            -t "build ${{ github.run_number }}" -n "auto build" || \
+          gh release create "build-${{ github.run_number }}" build.log \
+            -t "build ${{ github.run_number }}" -n "build log only" || true
