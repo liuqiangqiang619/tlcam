@@ -485,6 +485,15 @@ static CVPixelBufferRef ScaleBuffer(CVPixelBufferRef src, size_t tw, size_t th) 
 @end
 
 @implementation TLProxy
+- (BOOL)respondsToSelector:(SEL)aSelector {
+    if ([super respondsToSelector:aSelector]) return YES;
+    id d = g_realDelegate;
+    return d && [d respondsToSelector:aSelector];
+}
+- (id)forwardingTargetForSelector:(SEL)aSelector {
+    id d = g_realDelegate;
+    return (d && [d respondsToSelector:aSelector]) ? d : nil;
+}
 - (void)captureOutput:(AVCaptureOutput*)output
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection*)connection {
@@ -512,7 +521,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
 
     if (!use) {                       // 还没有 PC 帧 → 透传相机
-        if (g_realDelegate) [g_realDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+        if (g_realDelegate && [g_realDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) [g_realDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
         return;
     }
 
@@ -525,7 +534,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         CMSampleTimingInfo timing = { dur, pts, pts };
         CMSampleBufferRef sb = NULL;
         if (CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, use, fmt, &timing, &sb) == noErr) {
-            if (g_realDelegate)
+            if (g_realDelegate && [g_realDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)])
                 [g_realDelegate captureOutput:output didOutputSampleBuffer:sb fromConnection:connection];
             CFRelease(sb);
         }
@@ -537,7 +546,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     CVPixelBufferRelease(use); use = NULL;
     } @catch (NSException* e) {
         if (use) { CVPixelBufferRelease(use); use = NULL; }
-        if (g_realDelegate) [g_realDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+        if (g_realDelegate && [g_realDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) [g_realDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
         NSLog(@"[TL] proxy exception %@", e);
     }
 }
@@ -550,6 +559,11 @@ static TLAudioProxy* g_ap = nil;
 
 static void my_setDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queue) {
     BOOL isAudio = [self isKindOfClass:NSClassFromString(@"AVCaptureAudioDataOutput")];
+    if (!delegate || !queue) {              // 解绑 / 销毁路径：原样透传，绝不替换
+        if (orig_setDelegate) orig_setDelegate(self, _cmd, delegate, queue);
+        return;
+    }
+    if (delegate == (id)g_proxy || delegate == (id)g_ap) return;   // 幂等：已经是我们的代理
     if (isAudio) g_realAudioDelegate = delegate; else g_realDelegate = delegate;
     g_realQueue = queue;
     if (!isAudio && !g_proxy) g_proxy = [TLProxy new];
