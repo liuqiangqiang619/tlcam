@@ -151,6 +151,8 @@ static NSData* g_sps = nil;
 static NSData* g_pps = nil;
 static int g_vtFrames = 0;
 
+static BOOL ReadFull(int s, void* buf, size_t n);
+
 static void VTReset(void) {
     if (g_vt) { VTDecompressionSessionInvalidate(g_vt); CFRelease(g_vt); g_vt = NULL; }
     if (g_vtFmt) { CFRelease(g_vtFmt); g_vtFmt = NULL; }
