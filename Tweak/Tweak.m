@@ -451,25 +451,25 @@ static void my_tap(id self, SEL _cmd, AVAudioNodeBus bus, AVAudioFrameCount bufS
 // ---------------- 代理：把 PC 帧交给抖音 ----------------
 // ---- PC 帧尺寸与相机不一致时，用 CoreImage 缩放到相机尺寸 ----
 static CIContext* g_ciCtx = nil;
-static CVPixelBufferPoolRef g_pool = NULL;
-static size_t g_poolW = 0, g_poolH = 0;
+static CVPixelBufferPoolRef g_scalePool = NULL;
+static size_t g_scalePoolW = 0, g_scalePoolH = 0;
 
 static CVPixelBufferRef ScaleBuffer(CVPixelBufferRef src, size_t tw, size_t th) {
     if (!g_ciCtx) g_ciCtx = [CIContext contextWithOptions:nil];
-    if (!g_pool || g_poolW != tw || g_poolH != th) {
-        if (g_pool) { CVPixelBufferPoolRelease(g_pool); g_pool = NULL; }
+    if (!g_scalePool || g_scalePoolW != tw || g_scalePoolH != th) {
+        if (g_scalePool) { CVPixelBufferPoolRelease(g_scalePool); g_scalePool = NULL; }
         NSDictionary* attrs = @{
             (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
             (id)kCVPixelBufferWidthKey: @(tw),
             (id)kCVPixelBufferHeightKey: @(th),
             (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
         };
-        CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &g_pool);
-        g_poolW = tw; g_poolH = th;
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &g_scalePool);
+        g_scalePoolW = tw; g_scalePoolH = th;
     }
-    if (!g_pool) return NULL;
+    if (!g_scalePool) return NULL;
     CVPixelBufferRef dst = NULL;
-    if (CVPixelBufferPoolCreatePixelBuffer(NULL, g_pool, &dst) != kCVReturnSuccess || !dst) return NULL;
+    if (CVPixelBufferPoolCreatePixelBuffer(NULL, g_scalePool, &dst) != kCVReturnSuccess || !dst) return NULL;
     CIImage* ci = [CIImage imageWithCVPixelBuffer:src];
     CGFloat sx = (CGFloat)tw / CVPixelBufferGetWidth(src);
     CGFloat sy = (CGFloat)th / CVPixelBufferGetHeight(src);
