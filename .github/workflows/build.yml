@@ -7,30 +7,40 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show toolchain
+      - name: Install toolchain
         run: |
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang ldid make curl jq
 
-      - name: Build TLCam.dylib (arm64)
+      - name: Fetch iPhoneOS SDK
         run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang -arch arm64 \
-                -miphoneos-version-min=15.0 \
-                -isysroot "$SDK" \
-                -fobjc-arc -O2 -dynamiclib \
-                -framework Foundation -framework UIKit \
-                -framework AVFoundation -framework CoreVideo \
-                -framework CoreImage -framework CoreGraphics -framework Vision -framework CoreMotion \
-                -framework CoreMedia -framework AudioToolbox \
-                -install_name @executable_path/Frameworks/TLCam.dylib \
-                Tweak/Tweak.m Tweak/IMUSynth.m -o TLCam.dylib
-          ls -lh TLCam.dylib
+          SDK=$(curl -s https://api.github.com/repos/theos/sdks/contents | jq -r '.[].name' | grep -E '^iPhoneOS[0-9.]+\.sdk$' | sort -V | tail -1)
+          echo "picked $SDK"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          git clone --filter=blob:none --no-checkout https://github.com/theos/sdks.git sdkrepo
+          cd sdkrepo
+          git sparse-checkout init --cone
+          git sparse-checkout set "$SDK"
+          git checkout
+
+      - name: Compile dylib
+        run: |
+          SYSROOT="$PWD/sdkrepo/$SDK"
+          clang --version
+          clang -target arm64-apple-ios15.0 -arch arm64 -isysroot "$SYSROOT" \
+            -fobjc-arc -O2 -dynamiclib -fno-modules \
+            -framework Foundation -framework UIKit -framework AVFoundation \
+            -framework CoreVideo -framework CoreImage -framework CoreGraphics \
+            -framework Vision -framework CoreMotion -framework CoreMedia \
+            -framework AudioToolbox -framework ImageIO \
+            Tweak/Tweak.m Tweak/IMUSynth.m -o TLCam.dylib -lpthread
+          ldid -S TLCam.dylib || true
           file TLCam.dylib
+          ls -l TLCam.dylib
 
       - uses: actions/upload-artifact@v4
         with:
