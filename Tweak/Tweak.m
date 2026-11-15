@@ -36,6 +36,9 @@ static id              g_realAudioDelegate = nil;
 static dispatch_queue_t g_realQueue   = nil;
 static id              g_proxy        = nil;
 
+#define TL_ENABLE_AUDIO 0
+#define TL_ENABLE_IMU   0
+
 static CVPixelBufferRef g_latest = NULL;      // 最新一帧（420f）
 static uint64_t         g_latestSeq = 0;      // 帧序号，用来判断“有没有新帧”
 static uint64_t         g_sentSeq = 0;
@@ -390,6 +393,10 @@ static CMSampleBufferRef MakeAudioBuffer(size_t frames) {
 - (void)captureOutput:(AVCaptureOutput*)output
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection*)connection {
+#if !TL_ENABLE_AUDIO
+    if (g_realAudioDelegate) [g_realAudioDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+    return;
+#endif
     CMSampleBufferRef sb = MakeAudioBuffer(1024);
     if (sb) {
         if (g_realAudioDelegate) [g_realAudioDelegate captureOutput:output didOutputSampleBuffer:sb fromConnection:connection];
@@ -449,9 +456,15 @@ static void my_tap(id self, SEL _cmd, AVAudioNodeBus bus, AVAudioFrameCount bufS
 - (void)captureOutput:(AVCaptureOutput*)output
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection*)connection {
+    CVPixelBufferRef inPB = CMSampleBufferGetImageBuffer(sampleBuffer);
     CVPixelBufferRef use = NULL;
     pthread_mutex_lock(&g_lock);
-    if (g_latest && g_latestSeq != g_sentSeq) {
+    BOOL dimOk = YES;
+    if (inPB && g_latest) {
+        dimOk = (CVPixelBufferGetWidth(inPB) == CVPixelBufferGetWidth(g_latest) &&
+                 CVPixelBufferGetHeight(inPB) == CVPixelBufferGetHeight(g_latest));
+    }
+    if (dimOk && g_latest && g_latestSeq != g_sentSeq) {
         use = CVPixelBufferRetain(g_latest);
         g_sentSeq = g_latestSeq;
     }
@@ -507,6 +520,7 @@ static void TLInit(void) {
         }
     }
     // AVAudioEngine 路径（部分版本用 inputNode tap 取麦）
+#if TL_ENABLE_AUDIO
     Class inNode = NSClassFromString(@"AVAudioInputNode");
     SEL tapSel = @selector(installTapOnBus:bufferSize:format:block:);
     Method tm = inNode ? class_getInstanceMethod(inNode, tapSel) : NULL;
@@ -515,6 +529,7 @@ static void TLInit(void) {
         method_setImplementation(tm, (IMP)my_tap);
         NSLog(@"[TL] hook AVAudioInputNode installTapOnBus");
     }
+#endif
 
     if (getenv("TL_AUDIO_PORT")) g_audioPort = atoi(getenv("TL_AUDIO_PORT"));
 

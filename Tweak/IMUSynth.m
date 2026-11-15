@@ -16,6 +16,10 @@
 #import <objc/runtime.h>
 #import <math.h>
 
+#ifndef TL_ENABLE_IMU
+#define TL_ENABLE_IMU 0
+#endif
+
 static double g_focalPx = 2780.0;   // 需要标定：拍一张已知角度旋转，反算
 static double g_fps      = 30.0;
 
@@ -158,6 +162,9 @@ static void my_start(id self, SEL _cmd, NSOperationQueue* q, id handler) {
 
 __attribute__((constructor))
 static void TLIMUInit(void) {
+#if !TL_ENABLE_IMU
+    return;
+#else
     Class c = NSClassFromString(@"CMMotionManager");
     SEL s = @selector(startDeviceMotionUpdatesToQueue:withHandler:);
     Method m = class_getInstanceMethod(c, s);
@@ -175,4 +182,5 @@ static void TLIMUInit(void) {
         if (g_csv) { fprintf(g_csv, "t,wx,wy,wz,dx,dy\n"); NSLog(@"[TL] dump -> %@", p); }
     }
     DumpIvars();
+#endif
 }
