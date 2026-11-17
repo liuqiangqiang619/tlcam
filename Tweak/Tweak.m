@@ -1025,15 +1025,13 @@ static void my_startRunning(id self, SEL _cmd) {
             id d = nil;
             @try { d = [o valueForKey:@"sampleBufferDelegate"]; } @catch (NSException* e) {}
             NSLog(@"[TL] audio output found delegate=%@", d ? NSStringFromClass([d class]) : @"nil");
+            /* 会话已经在跑，此时再 set 代理会被 AVFoundation 抛异常，所以这里只记录不改。
+               真正的代理安装走 my_setDelegate（加载时就 hook，早于抖音设置）。 */
             if (d && d != (id)g_ap) {
                 g_realAudioDelegate = d;
-                { IMP ob = TLOrigSetDelegate(o); if (ob) ((void(*)(id,SEL,id,dispatch_queue_t))ob)(o, @selector(setSampleBufferDelegate:queue:), (id)g_ap, g_aq); }
-                g_apSet = 1;
-                NSLog(@"[TL] audio delegate STOLEN from %@", NSStringFromClass([d class]));
+                NSLog(@"[TL] audio delegate found %@ (keep)", NSStringFromClass([d class]));
             } else if (!d) {
-                { IMP ob = TLOrigSetDelegate(o); if (ob) ((void(*)(id,SEL,id,dispatch_queue_t))ob)(o, @selector(setSampleBufferDelegate:queue:), (id)g_ap, g_aq); }
-                g_apSet = 1;
-                NSLog(@"[TL] audio delegate installed (was nil)");
+                NSLog(@"[TL] audio output has no delegate");
             }
         }
     } @catch (NSException* e) {
