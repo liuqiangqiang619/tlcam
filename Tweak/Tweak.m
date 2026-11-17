@@ -909,6 +909,26 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 // ---------------- 交换 setSampleBufferDelegate:queue: ----------------
 static void (*orig_setDelegate)(id, SEL, id, dispatch_queue_t) = NULL;
 
+/* 每个类各自的原始实现：AVCaptureVideoDataOutput 与 AVCaptureAudioDataOutput 实现不同，
+   共用一个 orig 会调错，重复 hook 还会把 orig 设成 hook 自己 → 无限递归爆栈。 */
+static Class g_sdCls[4]; static IMP g_sdImp[4]; static int g_sdN = 0;
+static void my_setDelegate(id, SEL, id, dispatch_queue_t);
+static void TLHookSetDelegate(Class c) {
+    if (!c) return;
+    for (int i = 0; i < g_sdN; i++) if (g_sdCls[i] == c) return;
+    Method m = class_getInstanceMethod(c, @selector(setSampleBufferDelegate:queue:));
+    if (!m) return;
+    IMP old = method_getImplementation(m);
+    if (old == (IMP)my_setDelegate) return;      /* 已经是我们的，不重复 */
+    method_setImplementation(m, (IMP)my_setDelegate);
+    if (g_sdN < 4) { g_sdCls[g_sdN] = c; g_sdImp[g_sdN] = old; g_sdN++; }
+}
+static IMP TLOrigSetDelegate(id self) {
+    Class c = object_getClass(self);
+    for (int i = 0; i < g_sdN; i++) if (g_sdCls[i] == c) return g_sdImp[i];
+    return NULL;
+}
+
 static TLAudioProxy* g_ap = nil;
 static int g_apSet = 0;
 
@@ -925,6 +945,7 @@ static IMP TLHookDelegateClass(Class c) {
     Method m = class_getInstanceMethod(c, sel);
     if (!m) return NULL;
     IMP old = method_getImplementation(m);
+    if (old == (IMP)PaintIfAudio) return NULL;      /* 已 hook 过，避免自递归 */
     method_setImplementation(m, (IMP)PaintIfAudio);
     g_hookedCls[g_hookedN] = c; g_hookedImp[g_hookedN] = old; g_hookedN++;
     return old;
@@ -937,19 +958,16 @@ static void PaintIfAudio(id self, SEL _cmd, id output, CMSampleBufferRef sb, id 
             PaintAudioIntoBuffer(sb);
         }
     } @catch (NSException* e) {}
-    for (int i = 0; i < g_hookedN; i++) {
-        if ([self class] == g_hookedCls[i]) {
-            IMP old = g_hookedImp[i];
-            if (old) ((void(*)(id,SEL,id,CMSampleBufferRef,id))old)(self, _cmd, output, sb, conn);
-            return;
-        }
-    }
+    IMP fwd = NULL;
+    for (int i = 0; i < g_hookedN; i++)
+        if ([self isKindOfClass:g_hookedCls[i]]) fwd = g_hookedImp[i];   /* 取最派生的一次 */
+    if (fwd) ((void(*)(id,SEL,id,CMSampleBufferRef,id))fwd)(self, _cmd, output, sb, conn);
 }
 static void my_setDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queue) {
   @try {
     BOOL isAudio = [self isKindOfClass:NSClassFromString(@"AVCaptureAudioDataOutput")];
     if (!delegate || !queue) {              // 解绑 / 销毁路径：原样透传，绝不替换
-        @try { if (orig_setDelegate) orig_setDelegate(self, _cmd, delegate, queue); } @catch (NSException* e) {}
+        @try { IMP o = TLOrigSetDelegate(self); if (o) ((void(*)(id,SEL,id,dispatch_queue_t))o)(self, _cmd, delegate, queue); } @catch (NSException* e) {}
         return;
     }
     if (delegate == (id)g_proxy || delegate == (id)g_ap) return;   // 幂等：已经是我们的代理
@@ -965,7 +983,8 @@ static void my_setDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queu
         if (!g_ap) g_ap = [TLAudioProxy new];
         if (cur == nil || cur == (id)g_ap) {
             @try {
-                if (orig_setDelegate) orig_setDelegate(self, _cmd, (id)g_ap, queue);
+                IMP o = TLOrigSetDelegate(self);
+                if (o) ((void(*)(id,SEL,id,dispatch_queue_t))o)(self, _cmd, (id)g_ap, queue);
                 g_apSet = 1;
             } @catch (NSException* e) {
                 NSLog(@"[TL] setDelegate audio throw: %@", e.reason);
@@ -979,8 +998,9 @@ static void my_setDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queu
     g_realQueue = queue;
     if (!isAudio && !g_proxy) g_proxy = [TLProxy new];
     if (isAudio && !g_ap) g_ap = [TLAudioProxy new];
-    if (orig_setDelegate) {
-        @try { orig_setDelegate(self, _cmd, isAudio ? (id)g_ap : (id)g_proxy, queue); }
+    {
+        IMP o = TLOrigSetDelegate(self);
+        @try { if (o) ((void(*)(id,SEL,id,dispatch_queue_t))o)(self, _cmd, isAudio ? (id)g_ap : (id)g_proxy, queue); }
         @catch (NSException* e) { NSLog(@"[TL] setDelegate video throw: %@", e.reason); }
     }
   } @catch (NSException* e) {
@@ -1007,11 +1027,11 @@ static void my_startRunning(id self, SEL _cmd) {
             NSLog(@"[TL] audio output found delegate=%@", d ? NSStringFromClass([d class]) : @"nil");
             if (d && d != (id)g_ap) {
                 g_realAudioDelegate = d;
-                if (orig_setDelegate) orig_setDelegate(o, @selector(setSampleBufferDelegate:queue:), (id)g_ap, g_aq);
+                { IMP ob = TLOrigSetDelegate(o); if (ob) ((void(*)(id,SEL,id,dispatch_queue_t))ob)(o, @selector(setSampleBufferDelegate:queue:), (id)g_ap, g_aq); }
                 g_apSet = 1;
                 NSLog(@"[TL] audio delegate STOLEN from %@", NSStringFromClass([d class]));
             } else if (!d) {
-                if (orig_setDelegate) orig_setDelegate(o, @selector(setSampleBufferDelegate:queue:), (id)g_ap, g_aq);
+                { IMP ob = TLOrigSetDelegate(o); if (ob) ((void(*)(id,SEL,id,dispatch_queue_t))ob)(o, @selector(setSampleBufferDelegate:queue:), (id)g_ap, g_aq); }
                 g_apSet = 1;
                 NSLog(@"[TL] audio delegate installed (was nil)");
             }
@@ -1156,14 +1176,13 @@ static void TLInstallAudioHooks(void) {
     SEL sel = @selector(setSampleBufferDelegate:queue:);
     Method m = class_getInstanceMethod(aud0, sel);
     if (m && !g_audioHookDone) {
-        if (!orig_setDelegate) orig_setDelegate = (void*)method_getImplementation(m);
-        method_setImplementation(m, (IMP)my_setDelegate);
+        TLHookSetDelegate(aud0);
         g_audioHookDone = 1;
         NSLog(@"[TL] audio hook installed at load");
     }
     SEL srSel = @selector(startRunning);
     Method srm = class_getInstanceMethod(sess0, srSel);
-    if (srm && !orig_startRunning) {
+    if (srm && !orig_startRunning && method_getImplementation(srm) != (IMP)my_startRunning) {
         orig_startRunning = (void*)method_getImplementation(srm);
         method_setImplementation(srm, (IMP)my_startRunning);
         NSLog(@"[TL] startRunning hook installed at load");
@@ -1187,15 +1206,14 @@ static void TLInstallHooks(void) {
         SEL sel = @selector(setSampleBufferDelegate:queue:);
         Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
         if (m) {
-            if (!orig_setDelegate) orig_setDelegate = (void*)method_getImplementation(m);
-            method_setImplementation(m, (IMP)my_setDelegate);
+            TLHookSetDelegate(cls);
             NSLog(@"[TL] hook %@", cn);
         }
     }
     Class sess = NSClassFromString(@"AVCaptureSession");
     SEL srSel = @selector(startRunning);
     Method srm = sess ? class_getInstanceMethod(sess, srSel) : NULL;
-    if (srm) {
+    if (srm && method_getImplementation(srm) != (IMP)my_startRunning) {
         orig_startRunning = (void*)method_getImplementation(srm);
         method_setImplementation(srm, (IMP)my_startRunning);
         NSLog(@"[TL] hook AVCaptureSession startRunning");
