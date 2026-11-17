@@ -1124,7 +1124,7 @@ static int g_audioHookDone = 0;
 static void TLInstallAudioHooks(void) {
     Class aud0 = NSClassFromString(@"AVCaptureAudioDataOutput");
     Class sess0 = NSClassFromString(@"AVCaptureSession");
-    if (!aud0 || !sess0) return;
+    if (!aud0) return;
     SEL sel = @selector(setSampleBufferDelegate:queue:);
     Method m = class_getInstanceMethod(aud0, sel);
     if (m && !g_audioHookDone) {
@@ -1206,9 +1206,9 @@ static void TLInit(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             /* audio hooks must beat Aweme's capture session: install at dylib load */
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < 2; i++) {
                 @try { TLInstallAudioHooks(); } @catch (NSException* e) {}
-                if (g_audioHookDone && orig_startRunning) break;
+                if (g_audioHookDone) break;
                 usleep(50 * 1000);
             }
             NSLog(@"[TL] audio early hooks done=%d startRunning=%d", g_audioHookDone, orig_startRunning ? 1 : 0);
