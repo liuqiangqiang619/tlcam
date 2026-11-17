@@ -908,6 +908,39 @@ static void (*orig_setDelegate)(id, SEL, id, dispatch_queue_t) = NULL;
 
 static TLAudioProxy* g_ap = nil;
 
+
+/* ---- paint inside Aweme's own delegate, without swapping the delegate ---- */
+static void PaintIfAudio(id self, SEL _cmd, id output, CMSampleBufferRef sb, id conn);
+
+static Class g_hookedCls[8]; static IMP g_hookedImp[8]; static int g_hookedN = 0;
+
+static IMP TLHookDelegateClass(Class c) {
+    for (int i = 0; i < g_hookedN; i++) if (g_hookedCls[i] == c) return g_hookedImp[i];
+    if (g_hookedN >= 8 || !c) return NULL;
+    SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) return NULL;
+    IMP old = method_getImplementation(m);
+    method_setImplementation(m, (IMP)PaintIfAudio);
+    g_hookedCls[g_hookedN] = c; g_hookedImp[g_hookedN] = old; g_hookedN++;
+    return old;
+}
+
+static void PaintIfAudio(id self, SEL _cmd, id output, CMSampleBufferRef sb, id conn) {
+    @try {
+        Class aud = NSClassFromString(@"AVCaptureAudioDataOutput");
+        if (aud && [output isKindOfClass:aud] && sb && g_audioGot) {
+            PaintAudioIntoBuffer(sb);
+        }
+    } @catch (NSException* e) {}
+    for (int i = 0; i < g_hookedN; i++) {
+        if ([self class] == g_hookedCls[i]) {
+            IMP old = g_hookedImp[i];
+            if (old) ((void(*)(id,SEL,id,CMSampleBufferRef,id))old)(self, _cmd, output, sb, conn);
+            return;
+        }
+    }
+}
 static void my_setDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queue) {
     BOOL isAudio = [self isKindOfClass:NSClassFromString(@"AVCaptureAudioDataOutput")];
     if (!delegate || !queue) {              // 解绑 / 销毁路径：原样透传，绝不替换
@@ -915,7 +948,13 @@ static void my_setDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queu
         return;
     }
     if (delegate == (id)g_proxy || delegate == (id)g_ap) return;   // 幂等：已经是我们的代理
-    if (isAudio) { g_realAudioDelegate = delegate; NSLog(@"[TL] setDelegate audio cls=%@", NSStringFromClass([delegate class])); }
+    if (isAudio) {
+        g_realAudioDelegate = delegate;
+        IMP old = TLHookDelegateClass([delegate class]);
+        NSLog(@"[TL] setDelegate audio cls=%@ hooked=%d", NSStringFromClass([delegate class]), old ? 1 : 0);
+        if (orig_setDelegate) orig_setDelegate(self, _cmd, delegate, queue);   /* keep Aweme's own delegate */
+        return;
+    }
     else g_realDelegate = delegate;
     g_realQueue = queue;
     if (!isAudio && !g_proxy) g_proxy = [TLProxy new];
@@ -1167,7 +1206,7 @@ static void TLInit(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             /* audio hooks must beat Aweme's capture session: install at dylib load */
-            for (int i = 0; i < 20; i++) {
+            for (int i = 0; i < 4; i++) {
                 @try { TLInstallAudioHooks(); } @catch (NSException* e) {}
                 if (g_audioHookDone && orig_startRunning) break;
                 usleep(50 * 1000);
