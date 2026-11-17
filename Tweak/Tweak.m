@@ -631,6 +631,8 @@ static BOOL PaintAudioIntoBuffer(CMSampleBufferRef sb) {
     }
     if (bb) CFRelease(bb);
     free(abl);
+    if (ok) { if ((++g_paintOk % 200) == 1) NSLog(@"[TL] audio painted=%llu", g_paintOk); }
+    else { if ((++g_paintFail % 200) == 1) NSLog(@"[TL] audio paint skip=%llu", g_paintFail); }
     return ok;
 }
 
@@ -911,11 +913,44 @@ static void my_setDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queu
         return;
     }
     if (delegate == (id)g_proxy || delegate == (id)g_ap) return;   // 幂等：已经是我们的代理
-    if (isAudio) g_realAudioDelegate = delegate; else g_realDelegate = delegate;
+    if (isAudio) { g_realAudioDelegate = delegate; NSLog(@"[TL] setDelegate audio cls=%@", NSStringFromClass([delegate class])); }
+    else g_realDelegate = delegate;
     g_realQueue = queue;
     if (!isAudio && !g_proxy) g_proxy = [TLProxy new];
     if (isAudio && !g_ap) g_ap = [TLAudioProxy new];
     if (orig_setDelegate) orig_setDelegate(self, _cmd, isAudio ? (id)g_ap : (id)g_proxy, queue);
+}
+
+// ---------------- 抢 audio delegate（应对 App 在我们 hook 之前就设过 delegate） ----------------
+static dispatch_queue_t g_aq = NULL;
+static uint64_t g_paintOk = 0, g_paintFail = 0;
+static void (*orig_startRunning)(id, SEL) = NULL;
+
+static void my_startRunning(id self, SEL _cmd) {
+    if (orig_startRunning) orig_startRunning(self, _cmd);
+    @try {
+        if (!g_ap) g_ap = [TLAudioProxy new];
+        if (!g_aq) g_aq = dispatch_queue_create("tl.audio", NULL);
+        Class aud = NSClassFromString(@"AVCaptureAudioDataOutput");
+        NSArray* outs = nil;
+        @try { outs = [self valueForKey:@"outputs"]; } @catch (NSException* e) {}
+        for (id o in outs) {
+            if (!aud || ![o isKindOfClass:aud]) continue;
+            id d = nil;
+            @try { d = [o valueForKey:@"sampleBufferDelegate"]; } @catch (NSException* e) {}
+            NSLog(@"[TL] audio output found delegate=%@", d ? NSStringFromClass([d class]) : @"nil");
+            if (d && d != (id)g_ap) {
+                g_realAudioDelegate = d;
+                if (orig_setDelegate) orig_setDelegate(o, @selector(setSampleBufferDelegate:queue:), (id)g_ap, g_aq);
+                NSLog(@"[TL] audio delegate STOLEN from %@", NSStringFromClass([d class]));
+            } else if (!d) {
+                if (orig_setDelegate) orig_setDelegate(o, @selector(setSampleBufferDelegate:queue:), (id)g_ap, g_aq);
+                NSLog(@"[TL] audio delegate installed (was nil)");
+            }
+        }
+    } @catch (NSException* e) {
+        NSLog(@"[TL] startRunning scan exception %@", e);
+    }
 }
 
 static void TLInstallHooks(void) {
@@ -929,6 +964,14 @@ static void TLInstallHooks(void) {
             method_setImplementation(m, (IMP)my_setDelegate);
             NSLog(@"[TL] hook %@", cn);
         }
+    }
+    Class sess = NSClassFromString(@"AVCaptureSession");
+    SEL srSel = @selector(startRunning);
+    Method srm = sess ? class_getInstanceMethod(sess, srSel) : NULL;
+    if (srm) {
+        orig_startRunning = (void*)method_getImplementation(srm);
+        method_setImplementation(srm, (IMP)my_startRunning);
+        NSLog(@"[TL] hook AVCaptureSession startRunning");
     }
     // AVAudioEngine 路径（部分版本用 inputNode tap 取麦）
 #if TL_ENABLE_AUDIO
