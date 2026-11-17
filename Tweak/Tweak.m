@@ -244,27 +244,39 @@ static void* USBVideoThread(void* arg) {
                 usleep(1000 * 1000);
                 continue;
             }
-            listen(ls, 1);
+            listen(ls, 8);
             NSLog(@"[TL] usb video listen %d", PC_PORT);
             while (1) {
                 int c = accept(ls, NULL, NULL);
                 if (c < 0) { usleep(200 * 1000); continue; }
                 int nd = 1;
                 setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+                setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &nd, sizeof(nd));
+                struct timeval tv = { 3, 0 };
+                setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
                 NSLog(@"[TL] usb video connected");
+                unsigned long long bytes = 0; int nals = 0; int vidErr = 0;
+                CFAbsoluteTime tStat = CFAbsoluteTimeGetCurrent();
                 while (1) {
                     uint8_t h[16];
-                    if (!ReadFull(c, h, 16)) break;
+                    if (!ReadFull(c, h, 16)) { vidErr = 1; break; }
                     uint32_t len = ((uint32_t)h[0] << 24) | ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | (uint32_t)h[3];
-                    if (len < 4 || len > 4 * 1024 * 1024) { NSLog(@"[TL] bad nal len %u", len); break; }
+                    if (len < 4 || len > 4 * 1024 * 1024) { NSLog(@"[TL] bad nal len %u", len); vidErr = 2; break; }
                     uint8_t* d = (uint8_t*)malloc(len);
-                    if (!d) break;
-                    if (!ReadFull(c, d, len)) { free(d); break; }
+                    if (!d) { vidErr = 3; break; }
+                    if (!ReadFull(c, d, len)) { free(d); vidErr = 4; break; }
+                    bytes += len; nals++;
                     @try { VTFeedNAL(d, len); } @catch (NSException* e) { NSLog(@"[TL] nal exception %@", e); }
                     free(d);
+                    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+                    if (now - tStat >= 2.0) {
+                        NSLog(@"[TL] vid rx bytes=%llu nals=%d vtFrames=%d sps=%d pps=%d", bytes, nals, (int)g_vtFrames,
+                              (int)g_sps.length, (int)g_pps.length);
+                        tStat = now;
+                    }
                 }
                 close(c);
-                NSLog(@"[TL] usb video closed");
+                NSLog(@"[TL] usb video closed bytes=%llu nals=%d vtFrames=%d err=%d", bytes, nals, (int)g_vtFrames, vidErr);
             }
         }
     }
@@ -474,27 +486,38 @@ static void* AudioThread(void* arg) {
             if (bind(ls, (struct sockaddr*)&a, sizeof(a)) != 0) {
                 close(ls); usleep(1000 * 1000); continue;
             }
-            listen(ls, 1);
+            listen(ls, 8);
             NSLog(@"[TL] usb audio listen %d", g_audioPort);
             while (1) {
                 int c = accept(ls, NULL, NULL);
                 if (c < 0) { usleep(200 * 1000); continue; }
                 int nd = 1;
                 setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+                setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &nd, sizeof(nd));
+                struct timeval tv = { 3, 0 };
+                setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
                 NSLog(@"[TL] usb audio connected");
+                unsigned long long abytes = 0; int blocks = 0; int audErr = 0;
+                CFAbsoluteTime atStat = CFAbsoluteTimeGetCurrent();
                 while (1) {
                     uint8_t h[16];
-                    if (!ReadFull(c, h, 16)) break;
+                    if (!ReadFull(c, h, 16)) { audErr = 1; break; }
                     uint32_t len = ((uint32_t)h[0] << 24) | ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | (uint32_t)h[3];
-                    if (len < 16 || len > 65536) { NSLog(@"[TL] bad pcm len %u", len); break; }
+                    if (len < 16 || len > 65536) { NSLog(@"[TL] bad pcm len %u", len); audErr = 2; break; }
                     uint8_t* d = (uint8_t*)malloc(len);
-                    if (!d) break;
-                    if (!ReadFull(c, d, len)) { free(d); break; }
+                    if (!d) { audErr = 3; break; }
+                    if (!ReadFull(c, d, len)) { free(d); audErr = 4; break; }
                     AudioPush(d, len);
                     free(d);
+                    abytes += len; blocks++;
+                    CFAbsoluteTime anow = CFAbsoluteTimeGetCurrent();
+                    if (anow - atStat >= 2.0) {
+                        NSLog(@"[TL] aud rx bytes=%llu blocks=%d", abytes, blocks);
+                        atStat = anow;
+                    }
                 }
                 close(c);
-                NSLog(@"[TL] usb audio closed");
+                NSLog(@"[TL] usb audio closed bytes=%llu blocks=%d err=%d", abytes, blocks, audErr);
             }
         }
     }
