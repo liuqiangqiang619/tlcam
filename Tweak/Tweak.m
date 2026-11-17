@@ -860,6 +860,14 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         use = CVPixelBufferRetain(g_latest);
         g_sentSeq = g_latestSeq;
     }
+    static int camDimLogged = 0;
+    if (!camDimLogged && inPB) {
+        camDimLogged = 1;
+        NSLog(@"[TL] cam buffer %zux%zu fmt=%u (pc frame %zux%zu)",
+              CVPixelBufferGetWidth(inPB), CVPixelBufferGetHeight(inPB),
+              (unsigned)CVPixelBufferGetPixelFormatType(inPB),
+              use ? CVPixelBufferGetWidth(use) : 0, use ? CVPixelBufferGetHeight(use) : 0);
+    }
     size_t inW = inPB ? CVPixelBufferGetWidth(inPB) : 0;
     size_t inH = inPB ? CVPixelBufferGetHeight(inPB) : 0;
     pthread_mutex_unlock(&g_lock);
