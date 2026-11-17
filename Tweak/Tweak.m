@@ -959,6 +959,8 @@ static void my_startRunning(id self, SEL _cmd) {
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <mach/mach.h>
+#import <mach/vm_map.h>
 
 static OSStatus (*g_auSetPropOrig)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, const void*, UInt32) = NULL;
 static AURenderCallback g_auCB = NULL;
@@ -1060,7 +1062,13 @@ static int TLHookC(void* target, void* repl, const char* name) {
                         uint64_t* slot = (uint64_t*)((const char*)mh + sec->offset + slide);
                         size_t cnt = sec->size / sizeof(uint64_t);
                         for (size_t k = 0; k < cnt; ++k) {
-                            if ((slot[k] & 0x0000FFFFFFFFFFFFULL) == tv) { slot[k] = (uint64_t)repl; ++hits; }
+                            if ((slot[k] & 0x0000FFFFFFFFFFFFULL) == tv) {
+                                vm_address_t pg = (vm_address_t)&slot[k] & ~(vm_page_size - 1);
+                                vm_size_t psz = (vm_address_t)&slot[k] + 8 - pg;
+                                if (vm_protect(mach_task_self(), pg, psz, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
+                                    slot[k] = (uint64_t)repl; ++hits;
+                                }
+                            }
                         }
                     }
                 }
@@ -1094,7 +1102,7 @@ static void TLInstallHooks(void) {
     }
     Class auCls = NSClassFromString(@"AVAudioUnit");
     (void)auCls;
-    {
+    if (!getenv("TL_NO_AUHOOK")) {
         void* p = dlsym(RTLD_DEFAULT, "AudioUnitSetProperty");
         g_auSetPropOrig = (OSStatus(*)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, const void*, UInt32))p;
         TLHookC(p, (void*)TL_AudioUnitSetProperty, "AudioUnitSetProperty");
