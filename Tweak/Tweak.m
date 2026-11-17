@@ -954,6 +954,124 @@ static void my_startRunning(id self, SEL _cmd) {
     }
 }
 
+
+// ---------------- AudioUnit（RTC SDK 常见路径）：抢 render callback ----------------
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+
+static OSStatus (*g_auSetPropOrig)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, const void*, UInt32) = NULL;
+static AudioUnitRenderCallback g_auCB = NULL;
+static void* g_auCBRef = NULL;
+static uint64_t g_auCBCount = 0;
+static AudioStreamBasicDescription g_auFmt;
+static int g_auFmtOK = 0;
+
+static void PaintABL(AudioBufferList* io, UInt32 frames) {
+    if (!io || io->mNumberBuffers == 0 || frames == 0) return;
+    if (g_ard == g_awr) return;
+    BOOL isFloat = g_auFmtOK ? ((g_auFmt.mFormatFlags & kAudioFormatFlagIsFloat) != 0) : YES;
+    BOOL nonInt  = g_auFmtOK ? ((g_auFmt.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0) : (io->mNumberBuffers > 1);
+    UInt32 ch = g_auFmtOK && g_auFmt.mChannelsPerFrame ? g_auFmt.mChannelsPerFrame : io->mNumberBuffers;
+    if (ch < 1) ch = 1;
+    size_t need = (size_t)frames * 4;
+    int16_t* src = (int16_t*)malloc(need);
+    if (!src) return;
+    size_t got = AudioPop(src, need);
+    size_t have = got / 4;
+    if (!have) { free(src); return; }
+    if (nonInt) {
+        for (UInt32 b = 0; b < io->mNumberBuffers; ++b) {
+            AudioBuffer* ab = &io->mBuffers[b];
+            if (!ab->mData) continue;
+            float* fp = (float*)ab->mData;
+            int16_t* ip = (int16_t*)ab->mData;
+            for (UInt32 f = 0; f < frames; ++f) {
+                float v = 0.f;
+                if (f < have) v = (b == 0 ? src[f*2] : src[f*2+1]) / 32768.0f;
+                if (isFloat) fp[f] = v; else ip[f] = (int16_t)(v * 32767.0f);
+            }
+        }
+    } else {
+        AudioBuffer* ab = &io->mBuffers[0];
+        if (ab->mData) {
+            float* fp = (float*)ab->mData;
+            int16_t* ip = (int16_t*)ab->mData;
+            for (UInt32 f = 0; f < frames; ++f) {
+                float l = 0.f, r = 0.f;
+                if (f < have) { l = src[f*2] / 32768.0f; r = src[f*2+1] / 32768.0f; }
+                for (UInt32 c = 0; c < ch; ++c) {
+                    float v = (c == 0) ? l : (c == 1 ? r : (l + r) * 0.5f);
+                    if (isFloat) fp[f*ch + c] = v; else ip[f*ch + c] = (int16_t)(v * 32767.0f);
+                }
+            }
+        }
+    }
+    free(src);
+}
+
+static OSStatus TL_AURenderCB(void* ref, AudioUnitRenderActionFlags* flags, const AudioTimeStamp* ts,
+                              UInt32 bus, UInt32 frames, AudioBufferList* io) {
+    OSStatus st = g_auCB ? g_auCB(g_auCBRef, flags, ts, bus, frames, io) : noErr;
+    if ((++g_auCBCount % 300) == 1)
+        NSLog(@"[TL] AU render #%llu frames=%u bufs=%u fmt=%d", g_auCBCount, (unsigned)frames,
+              io ? (unsigned)io->mNumberBuffers : 0, g_auFmtOK);
+    @try { PaintABL(io, frames); } @catch (NSException* e) { NSLog(@"[TL] paintAU exception %@", e); }
+    return st;
+}
+
+static OSStatus TL_AudioUnitSetProperty(AudioUnit u, AudioUnitPropertyID pid, AudioUnitScope sc,
+                                        AudioUnitElement el, const void* data, UInt32 size) {
+    if (pid == kAudioUnitProperty_SetRenderCallback && data && size >= sizeof(AURenderCallbackStruct)) {
+        AURenderCallbackStruct* rs = (AURenderCallbackStruct*)data;
+        g_auCB = rs->inputProc;
+        g_auCBRef = rs->inputProcRefCon;
+        NSLog(@"[TL] AU render callback captured scope=%u el=%u", (unsigned)sc, (unsigned)el);
+        AURenderCallbackStruct ns = { TL_AURenderCB, NULL };
+        return g_auSetPropOrig ? g_auSetPropOrig(u, pid, sc, el, &ns, sizeof(ns)) : noErr;
+    }
+    if (pid == kAudioUnitProperty_StreamFormat && data && size >= sizeof(AudioStreamBasicDescription)) {
+        memcpy(&g_auFmt, data, sizeof(AudioStreamBasicDescription));
+        g_auFmtOK = 1;
+        NSLog(@"[TL] AU fmt %.0fHz ch=%u bits=%u flags=0x%x", g_auFmt.mSampleRate,
+              (unsigned)g_auFmt.mChannelsPerFrame, (unsigned)g_auFmt.mBitsPerChannel, (unsigned)g_auFmt.mFormatFlags);
+    }
+    return g_auSetPropOrig ? g_auSetPropOrig(u, pid, sc, el, data, size) : noErr;
+}
+
+// 在已加载镜像的 __got / __la_symbol_ptr 里，把指向 target 的槽位换成 repl
+static int TLHookC(void* target, void* repl, const char* name) {
+    if (!target || !repl) return 0;
+    uint64_t tv = (uint64_t)target & 0x0000FFFFFFFFFFFFULL;
+    int hits = 0;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; ++i) {
+        const struct mach_header_64* mh = (const struct mach_header_64*)_dyld_get_image_header(i);
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        const struct load_command* lc = (const struct load_command*)((const char*)mh + sizeof(struct mach_header_64));
+        for (uint32_t c = 0; c < mh->ncmds && lc; ++c) {
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64* seg = (const struct segment_command_64*)lc;
+                if (!strcmp(seg->segname, "__DATA") || !strcmp(seg->segname, "__DATA_CONST")) {
+                    const struct section_64* sec = (const struct section_64*)((const char*)seg + sizeof(*seg));
+                    for (uint32_t s = 0; s < seg->nsects; ++s, ++sec) {
+                        if (strcmp(sec->sectname, "__got") && strcmp(sec->sectname, "__la_symbol_ptr")) continue;
+                        uint64_t* slot = (uint64_t*)((const char*)mh + sec->offset + slide);
+                        size_t cnt = sec->size / sizeof(uint64_t);
+                        for (size_t k = 0; k < cnt; ++k) {
+                            if ((slot[k] & 0x0000FFFFFFFFFFFFULL) == tv) { slot[k] = (uint64_t)repl; ++hits; }
+                        }
+                    }
+                }
+            }
+            lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+        }
+    }
+    NSLog(@"[TL] hookC %s hits=%d", name, hits);
+    return hits;
+}
+
 static void TLInstallHooks(void) {
     // 视频与音频输出都要换 delegate（两者没有共同的方法实现，分别 hook）
     for (NSString* cn in @[@"AVCaptureVideoDataOutput", @"AVCaptureAudioDataOutput"]) {
@@ -973,6 +1091,13 @@ static void TLInstallHooks(void) {
         orig_startRunning = (void*)method_getImplementation(srm);
         method_setImplementation(srm, (IMP)my_startRunning);
         NSLog(@"[TL] hook AVCaptureSession startRunning");
+    }
+    Class auCls = NSClassFromString(@"AVAudioUnit");
+    (void)auCls;
+    {
+        void* p = dlsym(RTLD_DEFAULT, "AudioUnitSetProperty");
+        g_auSetPropOrig = (OSStatus(*)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, const void*, UInt32))p;
+        TLHookC(p, (void*)TL_AudioUnitSetProperty, "AudioUnitSetProperty");
     }
     // AVAudioEngine 路径（部分版本用 inputNode tap 取麦）
 #if TL_ENABLE_AUDIO
