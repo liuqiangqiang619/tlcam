@@ -961,7 +961,7 @@ static void my_startRunning(id self, SEL _cmd) {
 #import <mach-o/loader.h>
 
 static OSStatus (*g_auSetPropOrig)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, const void*, UInt32) = NULL;
-static AudioUnitRenderCallback g_auCB = NULL;
+static AURenderCallback g_auCB = NULL;
 static void* g_auCBRef = NULL;
 static uint64_t g_auCBCount = 0;
 static AudioStreamBasicDescription g_auFmt;
