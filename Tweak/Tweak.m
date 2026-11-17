@@ -1080,6 +1080,39 @@ static int TLHookC(void* target, void* repl, const char* name) {
     return hits;
 }
 
+
+static int g_audioHookDone = 0;
+static void TLInstallAudioHooks(void) {
+    Class aud0 = NSClassFromString(@"AVCaptureAudioDataOutput");
+    Class sess0 = NSClassFromString(@"AVCaptureSession");
+    if (!aud0 || !sess0) return;
+    SEL sel = @selector(setSampleBufferDelegate:queue:);
+    Method m = class_getInstanceMethod(aud0, sel);
+    if (m && !g_audioHookDone) {
+        if (!orig_setDelegate) orig_setDelegate = (void*)method_getImplementation(m);
+        method_setImplementation(m, (IMP)my_setDelegate);
+        g_audioHookDone = 1;
+        NSLog(@"[TL] audio hook installed at load");
+    }
+    SEL srSel = @selector(startRunning);
+    Method srm = class_getInstanceMethod(sess0, srSel);
+    if (srm && !orig_startRunning) {
+        orig_startRunning = (void*)method_getImplementation(srm);
+        method_setImplementation(srm, (IMP)my_startRunning);
+        NSLog(@"[TL] startRunning hook installed at load");
+    }
+#if TL_ENABLE_AUDIO
+    Class inNode = NSClassFromString(@"AVAudioInputNode");
+    SEL tapSel = @selector(installTapOnBus:bufferSize:format:block:);
+    Method tm = inNode ? class_getInstanceMethod(inNode, tapSel) : NULL;
+    if (tm && !orig_tap) {
+        orig_tap = (void*)method_getImplementation(tm);
+        method_setImplementation(tm, (IMP)my_tap);
+        NSLog(@"[TL] tap hook installed at load");
+    }
+#endif
+}
+
 static void TLInstallHooks(void) {
     // 视频与音频输出都要换 delegate（两者没有共同的方法实现，分别 hook）
     for (NSString* cn in @[@"AVCaptureVideoDataOutput", @"AVCaptureAudioDataOutput"]) {
@@ -1102,7 +1135,7 @@ static void TLInstallHooks(void) {
     }
     Class auCls = NSClassFromString(@"AVAudioUnit");
     (void)auCls;
-    if (!getenv("TL_NO_AUHOOK")) {
+    if (getenv("TL_AUHOOK")) {
         void* p = dlsym(RTLD_DEFAULT, "AudioUnitSetProperty");
         g_auSetPropOrig = (OSStatus(*)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, const void*, UInt32))p;
         TLHookC(p, (void*)TL_AudioUnitSetProperty, "AudioUnitSetProperty");
@@ -1133,6 +1166,13 @@ static void TLInit(void) {
         // 延迟 0.8s，等 App 完成启动、类都加载好再装 hook
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
+            /* audio hooks must beat Aweme's capture session: install at dylib load */
+            for (int i = 0; i < 20; i++) {
+                @try { TLInstallAudioHooks(); } @catch (NSException* e) {}
+                if (g_audioHookDone && orig_startRunning) break;
+                usleep(50 * 1000);
+            }
+            NSLog(@"[TL] audio early hooks done=%d startRunning=%d", g_audioHookDone, orig_startRunning ? 1 : 0);
             @try { TLInstallHooks(); }
             @catch (NSException* e) { NSLog(@"[TL] install exception: %@", e); }
         });
