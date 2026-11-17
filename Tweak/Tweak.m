@@ -158,6 +158,15 @@ static void VTReset(void) {
     if (g_vtFmt) { CFRelease(g_vtFmt); g_vtFmt = NULL; }
 }
 
+static uint64_t nowMs_(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000);
+}
+static uint64_t g_feedMs[128];
+static volatile int g_feedIdx = 0, g_outIdx = 0;
+static volatile int g_fedFrames = 0;
+static long long g_lagMax = 0, g_lagSum = 0; static int g_lagN = 0;
 static void VTDecCallback(void* refCon, void* srcFrame, OSStatus status,
                           VTDecodeInfoFlags flags, CVImageBufferRef image,
                           CMTime pts, CMTime dur) {
@@ -169,6 +178,15 @@ static void VTDecCallback(void* refCon, void* srcFrame, OSStatus status,
     g_latestSeq++;
     pthread_mutex_unlock(&g_lock);
     g_vtFrames++;
+    {
+        int oi = g_outIdx % 128;
+        uint64_t fed = g_feedMs[oi];
+        if (fed) {
+            long long lag = (long long)(nowMs_() - fed);
+            if (lag >= 0 && lag < 5000) { g_lagSum += lag; g_lagN++; if (lag > g_lagMax) g_lagMax = lag; }
+        }
+        g_outIdx++;
+    }
 }
 
 static void VTEnsureSession(void) {
@@ -194,7 +212,8 @@ static void VTEnsureSession(void) {
         g_vt = NULL;
         return;
     }
-    NSLog(@"[TL] h264 decoder ready %dx%d", (int)CMVideoFormatDescriptionGetDimensions(g_vtFmt).width,
+    VTDecompressionSessionSetProperty(g_vt, kVTDecompressionPropertyKey_RealTime, kCFBooleanTrue);
+    NSLog(@"[TL] h264 decoder ready %dx%d realtime=1", (int)CMVideoFormatDescriptionGetDimensions(g_vtFmt).width,
           (int)CMVideoFormatDescriptionGetDimensions(g_vtFmt).height);
 }
 
@@ -221,6 +240,8 @@ static void VTFeedNAL(const uint8_t* p, size_t n) {
     size_t sz = total;
     CMSampleTimingInfo t = { CMTimeMake(1, 30), kCMTimeInvalid, kCMTimeInvalid };
     if (CMSampleBufferCreateReady(kCFAllocatorDefault, bb, g_vtFmt, 1, 1, &t, 1, &sz, &sb) == noErr && sb) {
+        g_feedMs[g_feedIdx % 128] = nowMs_();
+        g_feedIdx++; g_fedFrames++;
         VTDecompressionSessionDecodeFrame(g_vt, sb, 0, NULL, 0);
         CFRelease(sb);
     }
@@ -270,8 +291,9 @@ static void* USBVideoThread(void* arg) {
                     free(d);
                     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
                     if (now - tStat >= 2.0) {
-                        NSLog(@"[TL] vid rx bytes=%llu nals=%d vtFrames=%d sps=%d pps=%d", bytes, nals, (int)g_vtFrames,
-                              (int)g_sps.length, (int)g_pps.length);
+                        NSLog(@"[TL] vid rx bytes=%llu nals=%d vtFrames=%d lag=%lldms backlog=%d sps=%d pps=%d", bytes, nals, (int)g_vtFrames,
+                              (g_lagN ? (long long)(g_lagSum / g_lagN) : 0), (int)(g_fedFrames - g_outIdx), (int)g_sps.length, (int)g_pps.length);
+                        g_lagSum = 0; g_lagN = 0;
                         tStat = now;
                     }
                 }
