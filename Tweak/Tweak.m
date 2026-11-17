@@ -562,6 +562,8 @@ static CMSampleBufferRef MakeAudioBuffer(size_t frames) {
 }
 
 // 把 PC 的 PCM 写进相机自己的 audio buffer（不新建 sample buffer，最不容易崩）
+static uint64_t g_paintOk = 0, g_paintFail = 0;
+
 static BOOL PaintAudioIntoBuffer(CMSampleBufferRef sb) {
     if (!sb) return NO;
     if (g_ard == g_awr) return NO;                       // 还没有 PC 音频
@@ -923,7 +925,6 @@ static void my_setDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queu
 
 // ---------------- 抢 audio delegate（应对 App 在我们 hook 之前就设过 delegate） ----------------
 static dispatch_queue_t g_aq = NULL;
-static uint64_t g_paintOk = 0, g_paintFail = 0;
 static void (*orig_startRunning)(id, SEL) = NULL;
 
 static void my_startRunning(id self, SEL _cmd) {
