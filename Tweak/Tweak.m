@@ -1178,13 +1178,8 @@ static void TLInstallAudioHooks(void) {
         g_audioHookDone = 1;
         NSLog(@"[TL] audio hook installed at load");
     }
-    SEL srSel = @selector(startRunning);
-    Method srm = class_getInstanceMethod(sess0, srSel);
-    if (srm && !orig_startRunning && method_getImplementation(srm) != (IMP)my_startRunning) {
-        orig_startRunning = (void*)method_getImplementation(srm);
-        method_setImplementation(srm, (IMP)my_startRunning);
-        NSLog(@"[TL] startRunning hook installed at load");
-    }
+    /* 不再 hook startRunning：它只用来打日志，而 hook 它曾导致自递归爆栈。
+       代理安装已由 my_setDelegate（加载时 hook，早于抖音设置）完成。 */
 #if TL_ENABLE_AUDIO
     Class inNode = NSClassFromString(@"AVAudioInputNode");
     SEL tapSel = @selector(installTapOnBus:bufferSize:format:block:);
@@ -1208,14 +1203,7 @@ static void TLInstallHooks(void) {
             NSLog(@"[TL] hook %@", cn);
         }
     }
-    Class sess = NSClassFromString(@"AVCaptureSession");
-    SEL srSel = @selector(startRunning);
-    Method srm = sess ? class_getInstanceMethod(sess, srSel) : NULL;
-    if (srm && method_getImplementation(srm) != (IMP)my_startRunning) {
-        orig_startRunning = (void*)method_getImplementation(srm);
-        method_setImplementation(srm, (IMP)my_startRunning);
-        NSLog(@"[TL] hook AVCaptureSession startRunning");
-    }
+    /* startRunning 不再 hook（见上） */
     Class auCls = NSClassFromString(@"AVAudioUnit");
     (void)auCls;
     if (getenv("TL_AUHOOK")) {
