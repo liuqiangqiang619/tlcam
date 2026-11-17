@@ -212,7 +212,7 @@ static void VTEnsureSession(void) {
         g_vt = NULL;
         return;
     }
-    VTDecompressionSessionSetProperty(g_vt, kVTDecompressionPropertyKey_RealTime, kCFBooleanTrue);
+    VTSessionSetProperty((VTSessionRef)g_vt, kVTDecompressionPropertyKey_RealTime, kCFBooleanTrue);
     NSLog(@"[TL] h264 decoder ready %dx%d realtime=1", (int)CMVideoFormatDescriptionGetDimensions(g_vtFmt).width,
           (int)CMVideoFormatDescriptionGetDimensions(g_vtFmt).height);
 }
