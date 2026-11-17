@@ -436,6 +436,7 @@ static size_t   g_ard = 0, g_awr = 0;
 static pthread_mutex_t g_alock = PTHREAD_MUTEX_INITIALIZER;
 static int      g_audioPort = 9801;
 static int      g_audioGot = 0;
+static int      g_audioEver = 0;
 
 static void AudioPush(const uint8_t* d, size_t n) {
     pthread_mutex_lock(&g_alock);
@@ -445,6 +446,7 @@ static void AudioPush(const uint8_t* d, size_t n) {
         if (g_awr == g_ard) g_ard = (g_ard + 1) % ARING_BYTES;   // 覆盖旧数据
     }
     g_audioGot++;
+    g_audioEver = 1;
     pthread_mutex_unlock(&g_alock);
 }
 
@@ -562,11 +564,11 @@ static CMSampleBufferRef MakeAudioBuffer(size_t frames) {
 }
 
 // 把 PC 的 PCM 写进相机自己的 audio buffer（不新建 sample buffer，最不容易崩）
-static uint64_t g_paintOk = 0, g_paintFail = 0;
+static uint64_t g_paintOk = 0, g_paintFail = 0, g_audioUnder = 0;
 
 static BOOL PaintAudioIntoBuffer(CMSampleBufferRef sb) {
     if (!sb) return NO;
-    if (g_ard == g_awr) return NO;                       // 还没有 PC 音频
+    if (!g_audioEver) return NO;                         // 还没有收到过 PC 音频
     CMFormatDescriptionRef fdesc = CMSampleBufferGetFormatDescription(sb);
     if (!fdesc) return NO;
     const AudioStreamBasicDescription* asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fdesc);
@@ -597,7 +599,8 @@ static BOOL PaintAudioIntoBuffer(CMSampleBufferRef sb) {
                 if (src) {
                     size_t got = AudioPop(src, need);
                     size_t have = got / 4;
-                    if (have > 0) {
+                    if (have < frames) g_audioUnder += (frames - have);
+                    {
                         for (UInt32 f = 0; f < frames; ++f) {
                             float l = 0.0f, r = 0.0f;
                             if (f < have) { l = src[f * 2] / 32768.0f; r = src[f * 2 + 1] / 32768.0f; }
@@ -633,7 +636,7 @@ static BOOL PaintAudioIntoBuffer(CMSampleBufferRef sb) {
     }
     if (bb) CFRelease(bb);
     free(abl);
-    if (ok) { if ((++g_paintOk % 200) == 1) NSLog(@"[TL] audio painted=%llu", g_paintOk); }
+    if (ok) { if ((++g_paintOk % 200) == 1) NSLog(@"[TL] audio painted=%llu under=%llu", g_paintOk, g_audioUnder); }
     else { if ((++g_paintFail % 200) == 1) NSLog(@"[TL] audio paint skip=%llu", g_paintFail); }
     return ok;
 }
