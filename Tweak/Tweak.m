@@ -199,7 +199,7 @@ static void VTEnsureSession(void) {
 }
 
 static void VTFeedNAL(const uint8_t* p, size_t n) {
-    if (n < 5) return;
+    if (n < 4) return;                 // PPS 只有 4 字节，之前卡在 <5 被丢掉
     int type = p[0] & 0x1f;
     if (type == 7) { g_sps = [NSData dataWithBytes:p length:n]; VTReset(); VTEnsureSession(); return; }
     if (type == 8) { g_pps = [NSData dataWithBytes:p length:n]; VTReset(); VTEnsureSession(); return; }
