@@ -910,6 +910,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 static void (*orig_setDelegate)(id, SEL, id, dispatch_queue_t) = NULL;
 
 static TLAudioProxy* g_ap = nil;
+static int g_apSet = 0;
 
 
 /* ---- paint inside Aweme's own delegate, without swapping the delegate ---- */
@@ -945,9 +946,10 @@ static void PaintIfAudio(id self, SEL _cmd, id output, CMSampleBufferRef sb, id 
     }
 }
 static void my_setDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queue) {
+  @try {
     BOOL isAudio = [self isKindOfClass:NSClassFromString(@"AVCaptureAudioDataOutput")];
     if (!delegate || !queue) {              // 解绑 / 销毁路径：原样透传，绝不替换
-        if (orig_setDelegate) orig_setDelegate(self, _cmd, delegate, queue);
+        @try { if (orig_setDelegate) orig_setDelegate(self, _cmd, delegate, queue); } @catch (NSException* e) {}
         return;
     }
     if (delegate == (id)g_proxy || delegate == (id)g_ap) return;   // 幂等：已经是我们的代理
@@ -955,14 +957,35 @@ static void my_setDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queu
         g_realAudioDelegate = delegate;
         IMP old = TLHookDelegateClass([delegate class]);
         NSLog(@"[TL] setDelegate audio cls=%@ hooked=%d", NSStringFromClass([delegate class]), old ? 1 : 0);
-        if (orig_setDelegate) orig_setDelegate(self, _cmd, delegate, queue);   /* keep Aweme's own delegate */
+        /* 采集已经在跑时再调原函数，AVFoundation 会抛 NSInvalidArgumentException 直接 abort。
+           所以：output 还没有 delegate（新会话）才由我们装代理；已有别人的 delegate 就只记录，
+           保持现有代理继续跑，绝不重复设置。 */
+        id cur = nil;
+        @try { cur = [self valueForKey:@"sampleBufferDelegate"]; } @catch (NSException* e) {}
+        if (!g_ap) g_ap = [TLAudioProxy new];
+        if (cur == nil || cur == (id)g_ap) {
+            @try {
+                if (orig_setDelegate) orig_setDelegate(self, _cmd, (id)g_ap, queue);
+                g_apSet = 1;
+            } @catch (NSException* e) {
+                NSLog(@"[TL] setDelegate audio throw: %@", e.reason);
+            }
+        } else {
+            NSLog(@"[TL] setDelegate audio skip (already %@)", NSStringFromClass([cur class]));
+        }
         return;
     }
     else g_realDelegate = delegate;
     g_realQueue = queue;
     if (!isAudio && !g_proxy) g_proxy = [TLProxy new];
     if (isAudio && !g_ap) g_ap = [TLAudioProxy new];
-    if (orig_setDelegate) orig_setDelegate(self, _cmd, isAudio ? (id)g_ap : (id)g_proxy, queue);
+    if (orig_setDelegate) {
+        @try { orig_setDelegate(self, _cmd, isAudio ? (id)g_ap : (id)g_proxy, queue); }
+        @catch (NSException* e) { NSLog(@"[TL] setDelegate video throw: %@", e.reason); }
+    }
+  } @catch (NSException* e) {
+    NSLog(@"[TL] setDelegate outer throw: %@", e.reason);
+  }
 }
 
 // ---------------- 抢 audio delegate（应对 App 在我们 hook 之前就设过 delegate） ----------------
@@ -985,9 +1008,11 @@ static void my_startRunning(id self, SEL _cmd) {
             if (d && d != (id)g_ap) {
                 g_realAudioDelegate = d;
                 if (orig_setDelegate) orig_setDelegate(o, @selector(setSampleBufferDelegate:queue:), (id)g_ap, g_aq);
+                g_apSet = 1;
                 NSLog(@"[TL] audio delegate STOLEN from %@", NSStringFromClass([d class]));
             } else if (!d) {
                 if (orig_setDelegate) orig_setDelegate(o, @selector(setSampleBufferDelegate:queue:), (id)g_ap, g_aq);
+                g_apSet = 1;
                 NSLog(@"[TL] audio delegate installed (was nil)");
             }
         }
