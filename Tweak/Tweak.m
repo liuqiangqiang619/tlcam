@@ -835,9 +835,12 @@ static CVPixelBufferRef ConvertToMatch(CVPixelBufferRef src, CVPixelBufferRef li
     if (!pool || CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &dst) != kCVReturnSuccess || !dst) return NULL;
     if (!g_ciCtx) g_ciCtx = [CIContext contextWithOptions:nil];
     CIImage* ci = [CIImage imageWithCVPixelBuffer:src];
-    CGFloat sx = (CGFloat)w / CVPixelBufferGetWidth(src);
-    CGFloat sy = (CGFloat)h / CVPixelBufferGetHeight(src);
-    ci = [ci imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
+    // 等比缩放 + 居中 + 黑边：相机 buffer 的宽高比不一定等于素材，各自独立缩放会把画面拉扁。
+    size_t sw = CVPixelBufferGetWidth(src), sh = CVPixelBufferGetHeight(src);
+    CGFloat sc = MIN((CGFloat)w / (CGFloat)(sw ? sw : 1), (CGFloat)h / (CGFloat)(sh ? sh : 1));
+    CGFloat dw = (CGFloat)sw * sc, dh = (CGFloat)sh * sc;
+    CGFloat ox = ((CGFloat)w - dw) * 0.5, oy = ((CGFloat)h - dh) * 0.5;
+    ci = [ci imageByApplyingTransform:CGAffineTransformScale(CGAffineTransformMakeTranslation(ox, oy), sc, sc)];
     [g_ciCtx render:ci toCVPixelBuffer:dst bounds:CGRectMake(0, 0, w, h)
          colorSpace:CGColorSpaceCreateDeviceRGB()];
     return dst;
@@ -860,10 +863,13 @@ static CVPixelBufferRef ScaleBuffer(CVPixelBufferRef src, size_t tw, size_t th) 
     CVPixelBufferRef dst = NULL;
     if (CVPixelBufferPoolCreatePixelBuffer(NULL, g_scalePool, &dst) != kCVReturnSuccess || !dst) return NULL;
     CIImage* ci = [CIImage imageWithCVPixelBuffer:src];
-    CGFloat sx = (CGFloat)tw / CVPixelBufferGetWidth(src);
-    CGFloat sy = (CGFloat)th / CVPixelBufferGetHeight(src);
-    CIImage* sc = [ci imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
-    [g_ciCtx render:sc toCVPixelBuffer:dst bounds:CGRectMake(0, 0, tw, th) colorSpace:CGColorSpaceCreateDeviceRGB()];
+    // 等比缩放 + 居中 + 黑边，理由同 ConvertToMatch：不能为了填满而拉伸画面
+    size_t sw = CVPixelBufferGetWidth(src), sh = CVPixelBufferGetHeight(src);
+    CGFloat sc = MIN((CGFloat)tw / (CGFloat)(sw ? sw : 1), (CGFloat)th / (CGFloat)(sh ? sh : 1));
+    CGFloat dw = (CGFloat)sw * sc, dh = (CGFloat)sh * sc;
+    CGFloat ox = ((CGFloat)tw - dw) * 0.5, oy = ((CGFloat)th - dh) * 0.5;
+    CIImage* sc2 = [ci imageByApplyingTransform:CGAffineTransformScale(CGAffineTransformMakeTranslation(ox, oy), sc, sc)];
+    [g_ciCtx render:sc2 toCVPixelBuffer:dst bounds:CGRectMake(0, 0, tw, th) colorSpace:CGColorSpaceCreateDeviceRGB()];
     return dst;
 }
 
