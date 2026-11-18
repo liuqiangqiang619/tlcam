@@ -21,6 +21,8 @@
 #import <string.h>
 #import <dispatch/dispatch.h>
 #import <netinet/tcp.h>
+#import <stdlib.h>
+#import <time.h>
 #import <VideoToolbox/VideoToolbox.h>
 
 // 由 IMUSynth.m 提供
@@ -137,7 +139,7 @@ static CIImage* CameraImperfections(CIImage* img, double dx, double dy) {
     CIFilter* blur = [CIFilter filterWithName:@"CIGaussianBlur"];
     if (blur) {
         [blur setValue:o forKey:kCIInputImageKey];
-        [blur setValue:@(0.35) forKey:@"inputRadius"];
+        [blur setValue:@(0.18) forKey:@"inputRadius"];
         if (blur.outputImage) o = blur.outputImage;
     }
     return o;
@@ -217,6 +219,39 @@ static void VTEnsureSession(void) {
           (int)CMVideoFormatDescriptionGetDimensions(g_vtFmt).height);
 }
 
+// ---------------- 真实采集时间戳 ----------------
+// 真机摄像头的 PTS 来自硬件时钟，帧间隔在 1/30 秒附近抖动、偶发相位跳变，
+// 绝不会像文件回放那样每帧都是精确的 33.3333ms。
+// 原版给的是 CMTimeInvalid（等于把时间戳这条破绽白送出去），这里改成带抖动的真时钟。
+static double   g_ptsLast    = 0;
+static double   g_ptsBias    = 0;
+static double   g_ptsBase    = -1;
+static uint64_t g_ptsJumpAt  = 0;
+
+static CMTime NextFramePTS(void) {
+    double   raw = CACurrentMediaTime();
+    if (g_ptsBase < 0) {           // 每路连接以首帧为 0 点，PTS 从 0 起算（会话语义）
+        g_ptsBase   = raw;
+        g_ptsLast   = 0;
+        g_ptsBias   = 0;
+        g_ptsJumpAt = 0;
+    }
+    double   now = raw - g_ptsBase;
+    uint64_t ms  = nowMs_();
+    if (ms >= g_ptsJumpAt) {
+        // 每 0.9~2.4 秒一次"重对时"：模拟 AE/AF 微调造成的相位跳变（±4.2ms）
+        g_ptsBias   = ((double)(rand() % 2001) / 1000.0 - 1.0) * 0.0042;
+        g_ptsJumpAt = ms + 900 + (uint32_t)(rand() % 1500);
+    } else {
+        // 帧间随机游走：真实抖动时序是相关的，不是独立白噪声
+        g_ptsBias = g_ptsBias * 0.90 + ((double)(rand() % 2001) / 1000.0 - 1.0) * 0.0007;
+    }
+    double pts = now + g_ptsBias;
+    if (pts <= g_ptsLast) pts = g_ptsLast + 0.0004;   // 保证严格单调，至少前进 0.4ms
+    g_ptsLast = pts;
+    return CMTimeMakeWithSeconds(pts, 1000000);       // 微秒时基，足够表达亚毫秒抖动
+}
+
 static void VTFeedNAL(const uint8_t* p, size_t n) {
     if (n < 4) return;                 // PPS 只有 4 字节，之前卡在 <5 被丢掉
     int type = p[0] & 0x1f;
@@ -238,7 +273,7 @@ static void VTFeedNAL(const uint8_t* p, size_t n) {
                                            NULL, 0, total, 0, &bb) != noErr) { free(buf); return; }
     CMSampleBufferRef sb = NULL;
     size_t sz = total;
-    CMSampleTimingInfo t = { CMTimeMake(1, 30), kCMTimeInvalid, kCMTimeInvalid };
+    CMSampleTimingInfo t = { CMTimeMake(1, 30), NextFramePTS(), kCMTimeInvalid };
     if (CMSampleBufferCreateReady(kCFAllocatorDefault, bb, g_vtFmt, 1, 1, &t, 1, &sz, &sb) == noErr && sb) {
         g_feedMs[g_feedIdx % 128] = nowMs_();
         g_feedIdx++; g_fedFrames++;
@@ -276,6 +311,8 @@ static void* USBVideoThread(void* arg) {
                 struct timeval tv = { 3, 0 };
                 setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
                 NSLog(@"[TL] usb video connected");
+                g_ptsBase = -1;   // 新连接：PTS 基准归零，重新开始抖动序列
+                srand((unsigned)time(NULL) ^ (unsigned)getpid());   // 每次开播抖动序列都不同
                 unsigned long long bytes = 0; int nals = 0; int vidErr = 0;
                 CFAbsoluteTime tStat = CFAbsoluteTimeGetCurrent();
                 while (1) {
