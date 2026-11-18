@@ -55,10 +55,12 @@ jobs:
 
       - name: Publish release asset
         if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "build-${{ github.run_number }}" TLCam.dylib build.log \
-            -t "build ${{ github.run_number }}" -n "auto build" || \
-          gh release create "build-${{ github.run_number }}" build.log \
-            -t "build ${{ github.run_number }}" -n "build log only" || true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: build ${{ github.run_number }}
+          body: auto build from ${{ github.sha }}
+          files: |
+            TLCam.dylib
+            build.log
+          fail_on_unmatched_files: false
