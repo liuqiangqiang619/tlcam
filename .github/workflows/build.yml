@@ -3,6 +3,8 @@ name: build-dylib
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - 'dist/**'
   workflow_dispatch:
 
 jobs:
@@ -53,8 +55,26 @@ jobs:
           name: TLCam-dylib
           path: TLCam.dylib
 
+      - name: Commit dylib to dist
+        if: always()
+        run: |
+          if [ -f TLCam.dylib ]; then
+            mkdir -p dist
+            cp TLCam.dylib dist/TLCam.dylib
+            cp build.log dist/build.log 2>/dev/null || true
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -f dist/TLCam.dylib dist/build.log 2>/dev/null || git add -f dist/TLCam.dylib
+            git commit -m "build: TLCam.dylib for ${{ github.sha }}" || echo "nothing to commit"
+            git pull --rebase --autostash origin main || true
+            git push origin HEAD:main || echo "push failed"
+          else
+            echo "no dylib produced"
+          fi
+
       - name: Publish release asset
         if: always()
+        continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
